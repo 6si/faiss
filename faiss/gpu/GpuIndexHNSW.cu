@@ -1,0 +1,155 @@
+// @lint-ignore-every LICENSELINT
+/**
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+/*
+ * Copyright (c) 2026, 6sense Insights Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <faiss/IndexHNSW.h>
+#include <faiss/IndexScalarQuantizer.h>
+#include <faiss/gpu/GpuIndexHNSW.h>
+#include <faiss/gpu/impl/GpuHnswBuild.cuh>
+#include <faiss/gpu/impl/GpuHnswSearch.cuh>
+#include <faiss/gpu/impl/GpuHnswTypes.h>
+
+#include <cstdio>
+#include <memory>
+#include <stdexcept>
+
+namespace faiss {
+namespace gpu {
+
+GpuIndexHNSW::GpuIndexHNSW(
+        GpuResourcesProvider* provider,
+        int dims,
+        faiss::MetricType metric,
+        GpuIndexHNSWConfig config)
+        : GpuIndex(provider->getResources(), dims, metric, 0.0f, config),
+          hnswConfig_(config) {
+    this->is_trained = false;
+}
+
+GpuIndexHNSW::~GpuIndexHNSW() = default;
+
+void GpuIndexHNSW::copyFrom(const faiss::IndexHNSW* index) {
+    FAISS_THROW_IF_NOT_MSG(index, "index must not be null");
+    FAISS_THROW_IF_NOT_MSG(index->ntotal > 0, "index must not be empty");
+
+    DeviceScope scope(config_.device);
+
+    this->d = index->d;
+    this->metric_type = index->metric_type;
+    this->ntotal = index->ntotal;
+
+    bool use_ip = (index->metric_type == faiss::METRIC_INNER_PRODUCT);
+    bool is_cosine = false;
+
+    if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
+        deviceIndex_ = from_faiss_hnsw_sq(*index, use_ip, is_cosine);
+    } else {
+        deviceIndex_ = from_faiss_hnsw_flat(*index, use_ip, is_cosine);
+    }
+
+    this->is_trained = true;
+}
+
+void GpuIndexHNSW::reset() {
+    deviceIndex_.reset();
+    this->ntotal = 0;
+    this->is_trained = false;
+}
+
+bool GpuIndexHNSW::addImplRequiresIDs_() const {
+    return false;
+}
+
+void GpuIndexHNSW::addImpl_(idx_t, const float*, const idx_t*) {
+    FAISS_THROW_MSG(
+            "GpuIndexHNSW does not support add(). "
+            "Build on CPU with IndexHNSW, then call copyFrom().");
+}
+
+void GpuIndexHNSW::searchImpl_(
+        idx_t n,
+        const float* x,
+        int k,
+        float* distances,
+        idx_t* labels,
+        const SearchParameters* search_params) const {
+    FAISS_THROW_IF_NOT_MSG(
+            this->is_trained && deviceIndex_,
+            "Index not loaded. Call copyFrom() first.");
+    FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
+
+    auto& idx = *deviceIndex_;
+    cudaStream_t stream = idx.search_stream;
+
+    GpuHnswSearchParams sp;
+    if (search_params) {
+        auto* params = dynamic_cast<const SearchParametersGpuHNSW*>(
+                search_params);
+        if (params) {
+            sp.ef = params->ef;
+            sp.search_width = params->search_width;
+            sp.max_iterations = params->max_iterations;
+            sp.thread_block_size = params->thread_block_size;
+            sp.overflow_factor = params->overflow_factor;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(idx.scratch_mutex);
+    auto& sc = idx.scratch;
+
+    int nq = static_cast<int>(n);
+    int dim = static_cast<int>(idx.dim);
+    int overflow_ef = sp.overflow_factor * sp.ef;
+    sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), overflow_ef);
+
+    // H2D: query vectors
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            sc.d_queries,
+            x,
+            static_cast<size_t>(nq) * dim * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream));
+
+    gpu_hnsw_search(stream, sp, idx, nq, k);
+
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // D2H: results
+    auto tmp = std::make_unique<uint64_t[]>(nq * k);
+    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+            tmp.get(),
+            sc.d_neighbors,
+            static_cast<size_t>(nq) * k * sizeof(uint64_t),
+            cudaMemcpyDeviceToHost));
+    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+            distances,
+            sc.d_distances,
+            static_cast<size_t>(nq) * k * sizeof(float),
+            cudaMemcpyDeviceToHost));
+
+    for (int i = 0; i < nq * k; i++) {
+        labels[i] = (tmp[i] == UINT64_MAX) ? -1 : static_cast<idx_t>(tmp[i]);
+    }
+}
+
+} // namespace gpu
+} // namespace faiss

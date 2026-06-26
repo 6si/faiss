@@ -1,0 +1,137 @@
+// @lint-ignore-every LICENSELINT
+/**
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+/*
+ * Copyright (c) 2026, 6sense Insights Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <faiss/gpu/impl/GpuHnswTypes.h>
+
+namespace faiss {
+namespace gpu {
+
+void GpuHnswSearchScratch::ensure(
+        int nq,
+        int k,
+        int dim,
+        int N,
+        int overflow_ef) {
+    size_t need_q = static_cast<size_t>(nq) * dim * sizeof(float);
+    if (need_q > queries_bytes) {
+        if (d_queries)
+            cudaFree(d_queries);
+        cudaMalloc(&d_queries, need_q);
+        queries_bytes = need_q;
+    }
+    size_t need_n = static_cast<size_t>(nq) * k * sizeof(uint64_t);
+    if (need_n > neighbors_bytes) {
+        if (d_neighbors)
+            cudaFree(d_neighbors);
+        cudaMalloc(&d_neighbors, need_n);
+        neighbors_bytes = need_n;
+    }
+    size_t need_d = static_cast<size_t>(nq) * k * sizeof(float);
+    if (need_d > distances_bytes) {
+        if (d_distances)
+            cudaFree(d_distances);
+        cudaMalloc(&d_distances, need_d);
+        distances_bytes = need_d;
+    }
+    if (nq > entry_cap) {
+        if (d_entry_points)
+            cudaFree(d_entry_points);
+        cudaMalloc(
+                &d_entry_points,
+                static_cast<size_t>(nq) * sizeof(uint32_t));
+        entry_cap = nq;
+    }
+    int bitmap_words = (N + 31) / 32;
+    size_t need_bm =
+            static_cast<size_t>(nq) * bitmap_words * sizeof(uint32_t);
+    if (need_bm > bitmap_bytes) {
+        if (d_visited_bitmaps)
+            cudaFree(d_visited_bitmaps);
+        cudaMalloc(&d_visited_bitmaps, need_bm);
+        bitmap_bytes = need_bm;
+    }
+    size_t ovf_entries = static_cast<size_t>(nq) * overflow_ef;
+    size_t need_ovf =
+            ovf_entries * (sizeof(uint32_t) + sizeof(float) + sizeof(uint32_t)) +
+            static_cast<size_t>(nq) * sizeof(int);
+    if (need_ovf > overflow_bytes) {
+        if (d_overflow_ids)
+            cudaFree(d_overflow_ids);
+        if (d_overflow_dists)
+            cudaFree(d_overflow_dists);
+        if (d_overflow_expanded)
+            cudaFree(d_overflow_expanded);
+        if (d_overflow_count)
+            cudaFree(d_overflow_count);
+        cudaMalloc(&d_overflow_ids, ovf_entries * sizeof(uint32_t));
+        cudaMalloc(&d_overflow_dists, ovf_entries * sizeof(float));
+        cudaMalloc(&d_overflow_expanded, ovf_entries * sizeof(uint32_t));
+        cudaMalloc(
+                &d_overflow_count,
+                static_cast<size_t>(nq) * sizeof(int));
+        overflow_bytes = need_ovf;
+    }
+}
+
+GpuHnswSearchScratch::~GpuHnswSearchScratch() {
+    if (d_queries)
+        cudaFree(d_queries);
+    if (d_neighbors)
+        cudaFree(d_neighbors);
+    if (d_distances)
+        cudaFree(d_distances);
+    if (d_entry_points)
+        cudaFree(d_entry_points);
+    if (d_visited_bitmaps)
+        cudaFree(d_visited_bitmaps);
+    if (d_overflow_ids)
+        cudaFree(d_overflow_ids);
+    if (d_overflow_dists)
+        cudaFree(d_overflow_dists);
+    if (d_overflow_expanded)
+        cudaFree(d_overflow_expanded);
+    if (d_overflow_count)
+        cudaFree(d_overflow_count);
+}
+
+GpuHnswDeviceIndex::~GpuHnswDeviceIndex() {
+    if (d_dataset)
+        cudaFree(d_dataset);
+    if (d_inv_norms)
+        cudaFree(d_inv_norms);
+    if (d_layer0_graph)
+        cudaFree(d_layer0_graph);
+    for (auto& ul : upper_layers) {
+        if (ul.d_node_ids)
+            cudaFree(ul.d_node_ids);
+        if (ul.d_neighbors)
+            cudaFree(ul.d_neighbors);
+    }
+    if (d_upper_layer_ptrs)
+        cudaFree(d_upper_layer_ptrs);
+    if (search_stream)
+        cudaStreamDestroy(search_stream);
+}
+
+} // namespace gpu
+} // namespace faiss
