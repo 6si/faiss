@@ -663,11 +663,13 @@ __global__ void layer0_beam_search_kernel(
                 }
             }
 
-            float new_worst = (rc >= ef) ? result_dists[rc - 1] : FLT_MAX;
-            if (new_worst < prev_worst) {
-                meta[3] = 0;
-            } else {
-                meta[3] = meta[3] + 1;
+            if (rc >= ef) {
+                float new_worst = result_dists[rc - 1];
+                if (new_worst < prev_worst) {
+                    meta[3] = 0;
+                } else {
+                    meta[3] = meta[3] + 1;
+                }
             }
 
             meta[0] = rc;
