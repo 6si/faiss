@@ -56,14 +56,11 @@ void GpuHnswSearchScratch::ensure(
     if (nq > entry_cap) {
         if (d_entry_points)
             cudaFree(d_entry_points);
-        cudaMalloc(
-                &d_entry_points,
-                static_cast<size_t>(nq) * sizeof(uint32_t));
+        cudaMalloc(&d_entry_points, static_cast<size_t>(nq) * sizeof(uint32_t));
         entry_cap = nq;
     }
     int bitmap_words = (N + 31) / 32;
-    size_t need_bm =
-            static_cast<size_t>(nq) * bitmap_words * sizeof(uint32_t);
+    size_t need_bm = static_cast<size_t>(nq) * bitmap_words * sizeof(uint32_t);
     if (need_bm > bitmap_bytes) {
         if (d_visited_bitmaps)
             cudaFree(d_visited_bitmaps);
@@ -71,8 +68,8 @@ void GpuHnswSearchScratch::ensure(
         bitmap_bytes = need_bm;
     }
     size_t ovf_entries = static_cast<size_t>(nq) * overflow_ef;
-    size_t need_ovf =
-            ovf_entries * (sizeof(uint32_t) + sizeof(float) + sizeof(uint32_t)) +
+    size_t need_ovf = ovf_entries *
+                    (sizeof(uint32_t) + sizeof(float) + sizeof(uint32_t)) +
             static_cast<size_t>(nq) * sizeof(int);
     if (need_ovf > overflow_bytes) {
         if (d_overflow_ids)
@@ -86,9 +83,7 @@ void GpuHnswSearchScratch::ensure(
         cudaMalloc(&d_overflow_ids, ovf_entries * sizeof(uint32_t));
         cudaMalloc(&d_overflow_dists, ovf_entries * sizeof(float));
         cudaMalloc(&d_overflow_expanded, ovf_entries * sizeof(uint32_t));
-        cudaMalloc(
-                &d_overflow_count,
-                static_cast<size_t>(nq) * sizeof(int));
+        cudaMalloc(&d_overflow_count, static_cast<size_t>(nq) * sizeof(int));
         overflow_bytes = need_ovf;
     }
 }

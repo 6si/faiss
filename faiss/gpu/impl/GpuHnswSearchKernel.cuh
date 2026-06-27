@@ -201,8 +201,8 @@ __global__ void upper_layer_search_kernel(
         bool improved = true;
         while (improved) {
             improved = false;
-            uint32_t local_idx = binary_search_node(
-                    lp.d_node_ids, lp.num_nodes, current);
+            uint32_t local_idx =
+                    binary_search_node(lp.d_node_ids, lp.num_nodes, current);
             if (local_idx == UINT32_MAX)
                 break;
 
@@ -210,11 +210,10 @@ __global__ void upper_layer_search_kernel(
             float best_nbr_dist = best_dist;
 
             for (uint32_t j = lane; j < lp.max_degree; j += 32) {
-                uint32_t nbr = __ldg(
-                        &lp.d_neighbors
-                                [static_cast<int64_t>(local_idx) *
-                                         lp.max_degree +
-                                 j]);
+                uint32_t nbr = __ldg(&lp.d_neighbors
+                                              [static_cast<int64_t>(local_idx) *
+                                                       lp.max_degree +
+                                               j]);
                 float dist = FLT_MAX;
                 if (nbr != UINT32_MAX) {
                     const DataT* nbr_vec =
@@ -263,8 +262,9 @@ __global__ void upper_layer_search_kernel(
 // Phase 2: Layer-0 beam search kernel with Overflow Candidate Queue (OCQ)
 // ============================================================================
 
-__device__ __forceinline__ bool
-bitmap_visit(uint32_t* bitmap, uint32_t node_id) {
+__device__ __forceinline__ bool bitmap_visit(
+        uint32_t* bitmap,
+        uint32_t node_id) {
     uint32_t word = node_id >> 5;
     uint32_t bit = 1u << (node_id & 31);
     uint32_t old = atomicOr(&bitmap[word], bit);
@@ -333,8 +333,7 @@ __global__ void layer0_beam_search_kernel(
     if (query_idx >= num_queries)
         return;
 
-    const float* query =
-            d_queries + static_cast<int64_t>(query_idx) * dim;
+    const float* query = d_queries + static_cast<int64_t>(query_idx) * dim;
 
     extern __shared__ char smem[];
 
@@ -351,16 +350,14 @@ __global__ void layer0_beam_search_kernel(
 
     int bitmap_words = (N + 31) / 32;
     uint32_t* visited_bmap =
-            d_visited_bitmaps +
-            static_cast<int64_t>(query_idx) * bitmap_words;
+            d_visited_bitmaps + static_cast<int64_t>(query_idx) * bitmap_words;
 
     uint32_t* ovf_ids =
             d_overflow_ids + static_cast<int64_t>(query_idx) * overflow_ef;
     float* ovf_dists =
             d_overflow_dists + static_cast<int64_t>(query_idx) * overflow_ef;
     uint32_t* ovf_exp =
-            d_overflow_expanded +
-            static_cast<int64_t>(query_idx) * overflow_ef;
+            d_overflow_expanded + static_cast<int64_t>(query_idx) * overflow_ef;
 
     for (int i = threadIdx.x; i < ef; i += blockDim.x) {
         result_ids[i] = UINT32_MAX;
@@ -382,16 +379,12 @@ __global__ void layer0_beam_search_kernel(
         float ep_dist;
         if (use_inner_product) {
             ep_dist = thread_ip_distance(
-                    query,
-                    d_dataset + static_cast<int64_t>(ep) * dim,
-                    dim);
+                    query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
             if (d_inv_norms)
                 ep_dist *= __ldg(&d_inv_norms[ep]);
         } else {
             ep_dist = thread_l2_distance(
-                    query,
-                    d_dataset + static_cast<int64_t>(ep) * dim,
-                    dim);
+                    query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
         }
         result_ids[0] = ep;
         result_dists[0] = ep_dist;
@@ -418,8 +411,7 @@ __global__ void layer0_beam_search_kernel(
 
     for (int j = group_id; j < max_degree0; j += num_groups) {
         uint32_t nbr = __ldg(
-                &d_layer0_graph
-                        [static_cast<int64_t>(ep) * max_degree0 + j]);
+                &d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j]);
 
         if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
             continue;
@@ -432,8 +424,7 @@ __global__ void layer0_beam_search_kernel(
         if (!is_new)
             continue;
 
-        const DataT* nbr_vec =
-                d_dataset + static_cast<int64_t>(nbr) * dim;
+        const DataT* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
         float dist;
         if (use_inner_product) {
             dist = coop_ip_distance(
@@ -544,8 +535,7 @@ __global__ void layer0_beam_search_kernel(
 
             if (num_parents == 0) {
                 int ovf_rc = d_overflow_count[query_idx];
-                for (int i = 0; i < ovf_rc && num_parents < search_width;
-                     i++) {
+                for (int i = 0; i < ovf_rc && num_parents < search_width; i++) {
                     if (!ovf_exp[i]) {
                         parent_ids[num_parents++] = ovf_ids[i];
                         ovf_exp[i] = 1;
@@ -570,10 +560,10 @@ __global__ void layer0_beam_search_kernel(
             int nbr_slot = wi % max_degree0;
 
             uint32_t parent = parent_ids[parent_idx];
-            uint32_t nbr = __ldg(
-                    &d_layer0_graph
-                            [static_cast<int64_t>(parent) * max_degree0 +
-                             nbr_slot]);
+            uint32_t nbr =
+                    __ldg(&d_layer0_graph
+                                  [static_cast<int64_t>(parent) * max_degree0 +
+                                   nbr_slot]);
 
             if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
                 continue;
@@ -586,8 +576,7 @@ __global__ void layer0_beam_search_kernel(
             if (!is_new)
                 continue;
 
-            const DataT* nbr_vec =
-                    d_dataset + static_cast<int64_t>(nbr) * dim;
+            const DataT* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
             float dist;
             if (use_inner_product) {
                 dist = coop_ip_distance(
@@ -623,8 +612,7 @@ __global__ void layer0_beam_search_kernel(
             int staging_count = min(meta[1], max_staging);
             int rc = meta[0];
             int ovf_rc = d_overflow_count[query_idx];
-            float prev_worst =
-                    (rc >= ef) ? result_dists[rc - 1] : FLT_MAX;
+            float prev_worst = (rc >= ef) ? result_dists[rc - 1] : FLT_MAX;
 
             for (int s = 0; s < staging_count; s++) {
                 uint32_t sid = staging_ids[s];
@@ -675,8 +663,7 @@ __global__ void layer0_beam_search_kernel(
                 }
             }
 
-            float new_worst =
-                    (rc >= ef) ? result_dists[rc - 1] : FLT_MAX;
+            float new_worst = (rc >= ef) ? result_dists[rc - 1] : FLT_MAX;
             if (new_worst < prev_worst) {
                 meta[3] = 0;
             } else {
@@ -701,15 +688,13 @@ __global__ void layer0_beam_search_kernel(
             d_distances[static_cast<int64_t>(query_idx) * k + i] =
                     result_dists[i];
         } else {
-            d_neighbors[static_cast<int64_t>(query_idx) * k + i] =
-                    UINT64_MAX;
+            d_neighbors[static_cast<int64_t>(query_idx) * k + i] = UINT64_MAX;
             d_distances[static_cast<int64_t>(query_idx) * k + i] = FLT_MAX;
         }
     }
 }
 
-inline size_t
-calc_layer0_smem_size(int ef, int search_width, int max_degree0) {
+inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0) {
     int max_staging = search_width * max_degree0;
 
     size_t size = 0;

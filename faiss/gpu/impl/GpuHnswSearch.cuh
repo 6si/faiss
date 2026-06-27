@@ -31,18 +31,17 @@
 #include <string>
 #include <vector>
 
-#include <faiss/gpu/impl/GpuHnswSearchKernel.cuh>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
+#include <faiss/gpu/impl/GpuHnswSearchKernel.cuh>
 
-#define GPU_HNSW_CUDA_CHECK(expr)                                     \
-    do {                                                              \
-        cudaError_t _e = (expr);                                      \
-        if (_e != cudaSuccess) {                                      \
-            throw std::runtime_error(                                 \
-                    std::string("CUDA error: ") +                     \
-                    cudaGetErrorString(_e) + " at " + __FILE__ + ":" + \
-                    std::to_string(__LINE__));                         \
-        }                                                             \
+#define GPU_HNSW_CUDA_CHECK(expr)                                          \
+    do {                                                                   \
+        cudaError_t _e = (expr);                                           \
+        if (_e != cudaSuccess) {                                           \
+            throw std::runtime_error(                                      \
+                    std::string("CUDA error: ") + cudaGetErrorString(_e) + \
+                    " at " + __FILE__ + ":" + std::to_string(__LINE__));   \
+        }                                                                  \
     } while (0)
 
 namespace faiss {
@@ -59,9 +58,8 @@ inline void gpu_hnsw_search(
     int ef = params.ef;
     int sw = params.search_width;
     int overflow_ef = params.overflow_factor * ef;
-    int max_iter = params.max_iterations > 0
-            ? params.max_iterations
-            : (ef + overflow_ef) / sw + 20;
+    int max_iter = params.max_iterations > 0 ? params.max_iterations
+                                             : (ef + overflow_ef) / sw + 20;
     int dim = static_cast<int>(idx.dim);
     int num_upper_layers = idx.num_upper_layers_built;
 
@@ -115,11 +113,11 @@ inline void gpu_hnsw_search(
             }
         }
 
-        size_t smem_size = hnsw_kernel::calc_layer0_smem_size(
-                ef, sw, idx.max_degree0);
+        size_t smem_size =
+                hnsw_kernel::calc_layer0_smem_size(ef, sw, idx.max_degree0);
         int N_int = static_cast<int>(idx.n_rows);
-        size_t bitmap_bytes = hnsw_kernel::calc_visited_bitmap_size(
-                num_queries, N_int);
+        size_t bitmap_bytes =
+                hnsw_kernel::calc_visited_bitmap_size(num_queries, N_int);
 
         GPU_HNSW_CUDA_CHECK(
                 cudaMemsetAsync(sc.d_visited_bitmaps, 0, bitmap_bytes, stream));

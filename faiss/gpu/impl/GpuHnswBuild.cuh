@@ -39,18 +39,17 @@
 #include <string>
 #include <vector>
 
-#include <faiss/gpu/impl/GpuHnswSearchKernel.cuh>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
+#include <faiss/gpu/impl/GpuHnswSearchKernel.cuh>
 
-#define GPU_HNSW_BUILD_CUDA_CHECK(expr)                               \
-    do {                                                              \
-        cudaError_t _e = (expr);                                      \
-        if (_e != cudaSuccess) {                                      \
-            throw std::runtime_error(                                 \
-                    std::string("CUDA error: ") +                     \
-                    cudaGetErrorString(_e) + " at " + __FILE__ + ":" + \
-                    std::to_string(__LINE__));                         \
-        }                                                             \
+#define GPU_HNSW_BUILD_CUDA_CHECK(expr)                                    \
+    do {                                                                   \
+        cudaError_t _e = (expr);                                           \
+        if (_e != cudaSuccess) {                                           \
+            throw std::runtime_error(                                      \
+                    std::string("CUDA error: ") + cudaGetErrorString(_e) + \
+                    " at " + __FILE__ + ":" + std::to_string(__LINE__));   \
+        }                                                                  \
     } while (0)
 
 namespace faiss {
@@ -124,8 +123,7 @@ inline void extract_faiss_hnsw_layers(
                 cudaMemcpyHostToDevice));
 
         GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(
-                &ul.d_neighbors,
-                ul.num_nodes * maxM * sizeof(uint32_t)));
+                &ul.d_neighbors, ul.num_nodes * maxM * sizeof(uint32_t)));
         GPU_HNSW_BUILD_CUDA_CHECK(cudaMemcpy(
                 ul.d_neighbors,
                 h_neighbors.data(),
@@ -228,8 +226,7 @@ inline void upload_int8_dataset(
 
     std::vector<int8_t> signed_codes(dataset_bytes);
     for (size_t i = 0; i < dataset_bytes; i++) {
-        signed_codes[i] =
-                static_cast<int8_t>(static_cast<int>(codes[i]) - 128);
+        signed_codes[i] = static_cast<int8_t>(static_cast<int>(codes[i]) - 128);
     }
 
     GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(&idx.d_dataset, dataset_bytes));
@@ -253,8 +250,7 @@ inline void upload_int8_dataset(
                     (sq_norm > 0.0f) ? (1.0f / std::sqrt(sq_norm)) : 0.0f;
         }
         size_t norms_bytes = static_cast<size_t>(n_rows) * sizeof(float);
-        GPU_HNSW_BUILD_CUDA_CHECK(
-                cudaMalloc(&idx.d_inv_norms, norms_bytes));
+        GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(&idx.d_inv_norms, norms_bytes));
         GPU_HNSW_BUILD_CUDA_CHECK(cudaMemcpy(
                 idx.d_inv_norms,
                 h_inv_norms.data(),
@@ -267,9 +263,8 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
         const faiss::IndexHNSW& hnsw_index,
         bool use_ip,
         bool is_cosine = false) {
-    const auto* sq_storage =
-            dynamic_cast<const faiss::IndexScalarQuantizer*>(
-                    hnsw_index.storage);
+    const auto* sq_storage = dynamic_cast<const faiss::IndexScalarQuantizer*>(
+            hnsw_index.storage);
     if (!sq_storage)
         throw std::runtime_error(
                 "gpu_hnsw: storage is not IndexScalarQuantizer");
@@ -282,8 +277,9 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
     idx->dim = dim;
     idx->use_ip = use_ip;
 
-    bool is_direct_signed = (sq_storage->sq.qtype ==
-                             faiss::ScalarQuantizer::QT_8bit_direct_signed);
+    bool is_direct_signed =
+            (sq_storage->sq.qtype ==
+             faiss::ScalarQuantizer::QT_8bit_direct_signed);
 
     if (is_direct_signed) {
         upload_int8_dataset(*idx, sq_storage->codes.data(), n_rows, is_cosine);

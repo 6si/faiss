@@ -24,9 +24,9 @@
 #include <faiss/IndexHNSW.h>
 #include <faiss/IndexScalarQuantizer.h>
 #include <faiss/gpu/GpuIndexHNSW.h>
+#include <faiss/gpu/impl/GpuHnswTypes.h>
 #include <faiss/gpu/impl/GpuHnswBuild.cuh>
 #include <faiss/gpu/impl/GpuHnswSearch.cuh>
-#include <faiss/gpu/impl/GpuHnswTypes.h>
 
 #include <cstdio>
 #include <memory>
@@ -102,8 +102,8 @@ void GpuIndexHNSW::searchImpl_(
 
     GpuHnswSearchParams sp;
     if (search_params) {
-        auto* params = dynamic_cast<const SearchParametersGpuHNSW*>(
-                search_params);
+        auto* params =
+                dynamic_cast<const SearchParametersGpuHNSW*>(search_params);
         if (params) {
             sp.ef = params->ef;
             sp.search_width = params->search_width;
