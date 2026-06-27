@@ -99,7 +99,7 @@ void GpuIndexHNSW::searchImpl_(
     FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
 
     auto& idx = *deviceIndex_;
-    cudaStream_t stream = idx.search_stream;
+    cudaStream_t stream = resources_->getDefaultStream(config_.device);
 
     GpuHnswSearchParams sp;
     if (search_params) {

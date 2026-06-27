@@ -193,8 +193,6 @@ inline void upload_graph_to_gpu(
                 cudaMemcpyHostToDevice));
     }
 
-    GPU_HNSW_BUILD_CUDA_CHECK(cudaStreamCreateWithFlags(
-            &idx.search_stream, cudaStreamNonBlocking));
 }
 
 inline void upload_fp32_dataset(
