@@ -137,6 +137,7 @@ void GpuIndexHNSW::searchImpl_(
                     "[gpu_hnsw] WARNING: dynamic_cast<SearchParametersGpuHNSW>"
                     " failed, using default ef=%d\n",
                     sp.ef);
+            fflush(stderr);
         }
     }
 
@@ -146,6 +147,7 @@ void GpuIndexHNSW::searchImpl_(
             k,
             sp.ef,
             got_params ? "direct" : "default");
+    fflush(stderr);
 
     std::lock_guard<std::mutex> lock(idx.scratch_mutex);
     auto& sc = idx.scratch;
