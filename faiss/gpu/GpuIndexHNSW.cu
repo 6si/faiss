@@ -199,5 +199,62 @@ void GpuIndexHNSW::searchImpl_(
     GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+void GpuIndexHNSW::searchHost(
+        idx_t n,
+        const float* x_host,
+        int k,
+        float* distances_host,
+        idx_t* labels_host,
+        const GpuHnswSearchParams& sp) const {
+    FAISS_THROW_IF_NOT_MSG(
+            this->is_trained && deviceIndex_,
+            "Index not loaded. Call copyFrom() first.");
+    FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
+
+    DeviceScope scope(config_.device);
+    auto& idx = *deviceIndex_;
+    cudaStream_t stream = resources_->getDefaultStream(config_.device);
+
+    std::lock_guard<std::mutex> lock(idx.scratch_mutex);
+    auto& sc = idx.scratch;
+
+    int nq = static_cast<int>(n);
+    int dim = static_cast<int>(idx.dim);
+    int overflow_ef = sp.overflow_factor * sp.ef;
+    sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), overflow_ef);
+
+    // H2D: query vectors from host to scratch
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            sc.d_queries,
+            x_host,
+            static_cast<size_t>(nq) * dim * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream));
+
+    gpu_hnsw_search(stream, sp, idx, nq, k);
+
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // D2H: distances directly to host output
+    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+            distances_host,
+            sc.d_distances,
+            static_cast<size_t>(nq) * k * sizeof(float),
+            cudaMemcpyDeviceToHost));
+
+    // D2H: labels with uint64_t → idx_t conversion
+    auto tmp = std::make_unique<uint64_t[]>(nq * k);
+    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+            tmp.get(),
+            sc.d_neighbors,
+            static_cast<size_t>(nq) * k * sizeof(uint64_t),
+            cudaMemcpyDeviceToHost));
+
+    for (int i = 0; i < nq * k; i++) {
+        labels_host[i] =
+                (tmp[i] == UINT64_MAX) ? -1 : static_cast<idx_t>(tmp[i]);
+    }
+}
+
 } // namespace gpu
 } // namespace faiss
