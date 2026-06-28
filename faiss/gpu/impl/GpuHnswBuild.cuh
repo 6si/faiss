@@ -304,8 +304,11 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_flat(
     int64_t n_rows = hnsw_index.ntotal;
     int64_t dim = hnsw_index.d;
 
-    const float* xb = flat_storage->get_xb();
-    std::vector<float> h_vectors(xb, xb + n_rows * dim);
+    // Use reconstruct_n instead of get_xb() — get_xb() can return a
+    // device pointer in GPU querynode context, causing SIGSEGV when
+    // accessed from CPU.
+    std::vector<float> h_vectors(n_rows * dim);
+    flat_storage->reconstruct_n(0, n_rows, h_vectors.data());
 
     auto idx = std::make_unique<GpuHnswDeviceIndex>();
     idx->n_rows = n_rows;
