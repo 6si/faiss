@@ -223,12 +223,12 @@ void GpuIndexHNSW::searchHost(
     int overflow_ef = sp.overflow_factor * sp.ef;
     sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), overflow_ef);
 
-    // H2D: query vectors from host to scratch
+    // Copy query vectors to scratch (auto-detect host or device source)
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             sc.d_queries,
             x_host,
             static_cast<size_t>(nq) * dim * sizeof(float),
-            cudaMemcpyHostToDevice,
+            cudaMemcpyDefault,
             stream));
 
     gpu_hnsw_search(stream, sp, idx, nq, k);
