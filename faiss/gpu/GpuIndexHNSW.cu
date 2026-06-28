@@ -211,6 +211,9 @@ void GpuIndexHNSW::searchHost(
             "Index not loaded. Call copyFrom() first.");
     FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
 
+    // Ensure CUDA context is active on this thread (Folly worker threads
+    // may not have set a device yet).
+    GPU_HNSW_CUDA_CHECK(cudaSetDevice(config_.device));
     DeviceScope scope(config_.device);
     auto& idx = *deviceIndex_;
     cudaStream_t stream = resources_->getDefaultStream(config_.device);
