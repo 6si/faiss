@@ -63,6 +63,19 @@ inline void gpu_hnsw_search(
     int dim = static_cast<int>(idx.dim);
     int num_upper_layers = idx.num_upper_layers_built;
 
+    fprintf(stderr,
+            "[gpu_hnsw_search] ef=%d sw=%d overflow_ef=%d max_iter=%d "
+            "N=%ld dim=%d max_degree0=%d use_ip=%d upper_layers=%d\n",
+            ef,
+            sw,
+            overflow_ef,
+            max_iter,
+            static_cast<long>(idx.n_rows),
+            dim,
+            idx.max_degree0,
+            static_cast<int>(idx.use_ip),
+            num_upper_layers);
+
     auto launch_kernels = [&]<typename DataT>(
                                   const DataT* d_data,
                                   const float* d_inv_norms) {

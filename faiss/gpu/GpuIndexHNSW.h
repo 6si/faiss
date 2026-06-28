@@ -24,7 +24,9 @@
 #pragma once
 
 #include <faiss/gpu/GpuIndex.h>
+#include <faiss/gpu/impl/GpuHnswTypes.h>
 
+#include <atomic>
 #include <memory>
 
 namespace faiss {
@@ -82,6 +84,10 @@ struct GpuIndexHNSW : public GpuIndex {
 
     void reset() override;
 
+    /// Set search parameters directly, bypassing SearchParameters.
+    /// Thread-safe: uses atomic/mutex internally.
+    void setSearchParams(const GpuHnswSearchParams& params) const;
+
    protected:
     bool addImplRequiresIDs_() const override;
 
@@ -99,6 +105,10 @@ struct GpuIndexHNSW : public GpuIndex {
     GpuIndexHNSWConfig hnswConfig_;
 
     std::unique_ptr<GpuHnswDeviceIndex> deviceIndex_;
+
+    mutable std::mutex searchParamsMutex_;
+    mutable GpuHnswSearchParams directSearchParams_;
+    mutable bool hasDirectSearchParams_ = false;
 };
 
 } // namespace gpu

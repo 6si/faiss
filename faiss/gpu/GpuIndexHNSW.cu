@@ -76,6 +76,13 @@ void GpuIndexHNSW::reset() {
     this->is_trained = false;
 }
 
+void GpuIndexHNSW::setSearchParams(
+        const GpuHnswSearchParams& params) const {
+    std::lock_guard<std::mutex> lock(searchParamsMutex_);
+    directSearchParams_ = params;
+    hasDirectSearchParams_ = true;
+}
+
 bool GpuIndexHNSW::addImplRequiresIDs_() const {
     return false;
 }
@@ -102,7 +109,20 @@ void GpuIndexHNSW::searchImpl_(
     cudaStream_t stream = resources_->getDefaultStream(config_.device);
 
     GpuHnswSearchParams sp;
-    if (search_params) {
+    bool got_params = false;
+
+    // Prefer direct params set via setSearchParams() — avoids dynamic_cast.
+    {
+        std::lock_guard<std::mutex> lock(searchParamsMutex_);
+        if (hasDirectSearchParams_) {
+            sp = directSearchParams_;
+            hasDirectSearchParams_ = false;
+            got_params = true;
+        }
+    }
+
+    // Fallback: try dynamic_cast from SearchParameters.
+    if (!got_params && search_params) {
         auto* params =
                 dynamic_cast<const SearchParametersGpuHNSW*>(search_params);
         if (params) {
@@ -111,8 +131,21 @@ void GpuIndexHNSW::searchImpl_(
             sp.max_iterations = params->max_iterations;
             sp.thread_block_size = params->thread_block_size;
             sp.overflow_factor = params->overflow_factor;
+            got_params = true;
+        } else {
+            fprintf(stderr,
+                    "[gpu_hnsw] WARNING: dynamic_cast<SearchParametersGpuHNSW>"
+                    " failed, using default ef=%d\n",
+                    sp.ef);
         }
     }
+
+    fprintf(stderr,
+            "[gpu_hnsw] searchImpl_ nq=%d k=%d ef=%d src=%s\n",
+            static_cast<int>(n),
+            k,
+            sp.ef,
+            got_params ? "direct" : "default");
 
     std::lock_guard<std::mutex> lock(idx.scratch_mutex);
     auto& sc = idx.scratch;
