@@ -60,6 +60,30 @@ __device__ __forceinline__ float thread_l2_distance(
     return sum;
 }
 
+// int8_t specialization: vectorized char4 loads (4 bytes per load vs 1)
+// dim must be divisible by 4 (true for all practical dimensions)
+template <>
+__device__ __forceinline__ float thread_l2_distance<int8_t>(
+        const float* __restrict__ query,
+        const int8_t* __restrict__ vec,
+        int dim) {
+    float sum = 0.0f;
+    int d = 0;
+    for (; d + 3 < dim; d += 4) {
+        char4 v4 = __ldg(reinterpret_cast<const char4*>(vec + d));
+        float d0 = query[d] - static_cast<float>(v4.x);
+        float d1 = query[d + 1] - static_cast<float>(v4.y);
+        float d2 = query[d + 2] - static_cast<float>(v4.z);
+        float d3 = query[d + 3] - static_cast<float>(v4.w);
+        sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+    }
+    for (; d < dim; d++) {
+        float diff = query[d] - static_cast<float>(__ldg(&vec[d]));
+        sum += diff * diff;
+    }
+    return sum;
+}
+
 template <typename DataT>
 __device__ __forceinline__ float thread_ip_distance(
         const float* __restrict__ query,
@@ -68,6 +92,27 @@ __device__ __forceinline__ float thread_ip_distance(
     float sum = 0.0f;
     for (int d = 0; d < dim; d++) {
         sum += query[d] * load_elem(vec, d);
+    }
+    return -sum;
+}
+
+// int8_t specialization: vectorized char4 loads
+template <>
+__device__ __forceinline__ float thread_ip_distance<int8_t>(
+        const float* __restrict__ query,
+        const int8_t* __restrict__ vec,
+        int dim) {
+    float sum = 0.0f;
+    int d = 0;
+    for (; d + 3 < dim; d += 4) {
+        char4 v4 = __ldg(reinterpret_cast<const char4*>(vec + d));
+        sum += query[d] * static_cast<float>(v4.x) +
+                query[d + 1] * static_cast<float>(v4.y) +
+                query[d + 2] * static_cast<float>(v4.z) +
+                query[d + 3] * static_cast<float>(v4.w);
+    }
+    for (; d < dim; d++) {
+        sum += query[d] * static_cast<float>(__ldg(&vec[d]));
     }
     return -sum;
 }
@@ -399,64 +444,33 @@ __global__ void layer0_beam_search_kernel(
     }
     __syncthreads();
 
-    // --- Seed with entry point's neighbors (warp-cooperative) ---
+    // --- Seed with entry point's neighbors ---
     if (threadIdx.x == 0)
         meta[1] = 0;
     __syncthreads();
 
-    int threads_per_dist = select_threads_per_dist(dim);
-    int num_groups = blockDim.x / threads_per_dist;
-    int group_id = threadIdx.x / threads_per_dist;
-    int lane_in_group = threadIdx.x % threads_per_dist;
-    int warp_lane = threadIdx.x % 32;
-    int group_in_warp = warp_lane / threads_per_dist;
-    uint32_t group_mask = ((1u << threads_per_dist) - 1)
-            << (group_in_warp * threads_per_dist);
-    int group_leader_lane = group_in_warp * threads_per_dist;
-
-    for (int j = group_id; j < max_degree0; j += num_groups) {
+    for (int j = threadIdx.x; j < max_degree0; j += blockDim.x) {
         uint32_t nbr = __ldg(
                 &d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j]);
-
         if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
             continue;
-
-        int is_new = 0;
-        if (lane_in_group == 0) {
-            is_new = bitmap_visit(visited_bmap, nbr) ? 1 : 0;
-        }
-        is_new = __shfl_sync(group_mask, is_new, group_leader_lane);
-        if (!is_new)
+        if (!bitmap_visit(visited_bmap, nbr))
             continue;
 
         const DataT* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
         float dist;
         if (use_inner_product) {
-            dist = coop_ip_distance(
-                    query,
-                    nbr_vec,
-                    dim,
-                    lane_in_group,
-                    threads_per_dist,
-                    group_mask);
-            if (lane_in_group == 0 && d_inv_norms)
+            dist = thread_ip_distance(query, nbr_vec, dim);
+            if (d_inv_norms)
                 dist *= __ldg(&d_inv_norms[nbr]);
         } else {
-            dist = coop_l2_distance(
-                    query,
-                    nbr_vec,
-                    dim,
-                    lane_in_group,
-                    threads_per_dist,
-                    group_mask);
+            dist = thread_l2_distance(query, nbr_vec, dim);
         }
 
-        if (lane_in_group == 0) {
-            int slot = atomicAdd(&meta[1], 1);
-            if (slot < max_staging) {
-                staging_ids[slot] = nbr;
-                staging_dists[slot] = dist;
-            }
+        int slot = atomicAdd(&meta[1], 1);
+        if (slot < max_staging) {
+            staging_ids[slot] = nbr;
+            staging_dists[slot] = dist;
         }
     }
     __syncthreads();
@@ -538,7 +552,7 @@ __global__ void layer0_beam_search_kernel(
         __syncthreads();
 
         int total_work = num_parents * max_degree0;
-        for (int wi = group_id; wi < total_work; wi += num_groups) {
+        for (int wi = threadIdx.x; wi < total_work; wi += blockDim.x) {
             int parent_idx = wi / max_degree0;
             int nbr_slot = wi % max_degree0;
 
@@ -547,46 +561,25 @@ __global__ void layer0_beam_search_kernel(
                     __ldg(&d_layer0_graph
                                   [static_cast<int64_t>(parent) * max_degree0 +
                                    nbr_slot]);
-
             if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
                 continue;
-
-            int is_new = 0;
-            if (lane_in_group == 0) {
-                is_new = bitmap_visit(visited_bmap, nbr) ? 1 : 0;
-            }
-            is_new = __shfl_sync(group_mask, is_new, group_leader_lane);
-            if (!is_new)
+            if (!bitmap_visit(visited_bmap, nbr))
                 continue;
 
             const DataT* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
             float dist;
             if (use_inner_product) {
-                dist = coop_ip_distance(
-                        query,
-                        nbr_vec,
-                        dim,
-                        lane_in_group,
-                        threads_per_dist,
-                        group_mask);
-                if (lane_in_group == 0 && d_inv_norms)
+                dist = thread_ip_distance(query, nbr_vec, dim);
+                if (d_inv_norms)
                     dist *= __ldg(&d_inv_norms[nbr]);
             } else {
-                dist = coop_l2_distance(
-                        query,
-                        nbr_vec,
-                        dim,
-                        lane_in_group,
-                        threads_per_dist,
-                        group_mask);
+                dist = thread_l2_distance(query, nbr_vec, dim);
             }
 
-            if (lane_in_group == 0) {
-                int slot = atomicAdd(&meta[1], 1);
-                if (slot < max_staging) {
-                    staging_ids[slot] = nbr;
-                    staging_dists[slot] = dist;
-                }
+            int slot = atomicAdd(&meta[1], 1);
+            if (slot < max_staging) {
+                staging_ids[slot] = nbr;
+                staging_dists[slot] = dist;
             }
         }
         __syncthreads();
