@@ -353,12 +353,16 @@ __global__ void layer0_beam_search_kernel(
     uint32_t* visited_bmap =
             d_visited_bitmaps + static_cast<int64_t>(query_idx) * bitmap_words;
 
-    uint32_t* ovf_ids =
-            d_overflow_ids + static_cast<int64_t>(query_idx) * overflow_ef;
-    float* ovf_dists =
-            d_overflow_dists + static_cast<int64_t>(query_idx) * overflow_ef;
-    uint32_t* ovf_exp =
-            d_overflow_expanded + static_cast<int64_t>(query_idx) * overflow_ef;
+    uint32_t* ovf_ids = overflow_ef > 0
+            ? d_overflow_ids + static_cast<int64_t>(query_idx) * overflow_ef
+            : nullptr;
+    float* ovf_dists = overflow_ef > 0
+            ? d_overflow_dists + static_cast<int64_t>(query_idx) * overflow_ef
+            : nullptr;
+    uint32_t* ovf_exp = overflow_ef > 0
+            ? d_overflow_expanded +
+                    static_cast<int64_t>(query_idx) * overflow_ef
+            : nullptr;
 
     for (int i = threadIdx.x; i < ef; i += blockDim.x) {
         result_ids[i] = UINT32_MAX;
@@ -369,8 +373,8 @@ __global__ void layer0_beam_search_kernel(
         meta[0] = 0;
         meta[1] = 0;
         meta[2] = 0;
-        meta[3] = 0;
-        d_overflow_count[query_idx] = 0;
+        if (overflow_ef > 0)
+            d_overflow_count[query_idx] = 0;
     }
     __syncthreads();
 
@@ -460,54 +464,32 @@ __global__ void layer0_beam_search_kernel(
     if (threadIdx.x == 0) {
         int staging_count = min(meta[1], max_staging);
         int rc = meta[0];
-        int ovf_rc = d_overflow_count[query_idx];
 
         for (int s = 0; s < staging_count; s++) {
             uint32_t sid = staging_ids[s];
             float sdist = staging_dists[s];
+            if (rc >= ef && sdist >= result_dists[rc - 1])
+                continue;
 
-            if (rc < ef || sdist < result_dists[rc - 1]) {
-                if (rc >= ef) {
-                    overflow_insert(
-                            ovf_ids,
-                            ovf_dists,
-                            ovf_exp,
-                            ovf_rc,
-                            overflow_ef,
-                            result_ids[ef - 1],
-                            result_dists[ef - 1],
-                            is_expanded[ef - 1]);
-                }
-                int lo = 0, hi = rc;
-                while (lo < hi) {
-                    int mid = (lo + hi) / 2;
-                    if (result_dists[mid] < sdist)
-                        lo = mid + 1;
-                    else
-                        hi = mid;
-                }
-                int insert_end = rc < ef ? rc : ef - 1;
-                for (int i = insert_end; i > lo; i--) {
-                    result_ids[i] = result_ids[i - 1];
-                    result_dists[i] = result_dists[i - 1];
-                    is_expanded[i] = is_expanded[i - 1];
-                }
-                result_ids[lo] = sid;
-                result_dists[lo] = sdist;
-                is_expanded[lo] = 0;
-                if (rc < ef)
-                    rc++;
-            } else {
-                overflow_insert(
-                        ovf_ids,
-                        ovf_dists,
-                        ovf_exp,
-                        ovf_rc,
-                        overflow_ef,
-                        sid,
-                        sdist,
-                        0);
+            int lo = 0, hi = rc;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (result_dists[mid] < sdist)
+                    lo = mid + 1;
+                else
+                    hi = mid;
             }
+            int insert_end = rc < ef ? rc : ef - 1;
+            for (int i = insert_end; i > lo; i--) {
+                result_ids[i] = result_ids[i - 1];
+                result_dists[i] = result_dists[i - 1];
+                is_expanded[i] = is_expanded[i - 1];
+            }
+            result_ids[lo] = sid;
+            result_dists[lo] = sdist;
+            is_expanded[lo] = 0;
+            if (rc < ef)
+                rc++;
         }
 
         for (int i = 0; i < rc; i++) {
@@ -517,7 +499,6 @@ __global__ void layer0_beam_search_kernel(
             }
         }
         meta[0] = rc;
-        d_overflow_count[query_idx] = ovf_rc;
     }
     __syncthreads();
 
@@ -534,9 +515,10 @@ __global__ void layer0_beam_search_kernel(
                 }
             }
 
-            if (num_parents == 0) {
+            if (num_parents == 0 && overflow_ef > 0) {
                 int ovf_rc = d_overflow_count[query_idx];
-                for (int i = 0; i < ovf_rc && num_parents < search_width; i++) {
+                for (int i = 0; i < ovf_rc && num_parents < search_width;
+                     i++) {
                     if (!ovf_exp[i]) {
                         parent_ids[num_parents++] = ovf_ids[i];
                         ovf_exp[i] = 1;
@@ -612,74 +594,40 @@ __global__ void layer0_beam_search_kernel(
         if (threadIdx.x == 0) {
             int staging_count = min(meta[1], max_staging);
             int rc = meta[0];
-            int ovf_rc = d_overflow_count[query_idx];
-            float prev_worst = (rc >= ef) ? result_dists[rc - 1] : FLT_MAX;
 
             for (int s = 0; s < staging_count; s++) {
                 uint32_t sid = staging_ids[s];
                 float sdist = staging_dists[s];
+                if (rc >= ef && sdist >= result_dists[rc - 1])
+                    continue;
 
-                if (rc < ef || sdist < result_dists[rc - 1]) {
-                    if (rc >= ef) {
-                        overflow_insert(
-                                ovf_ids,
-                                ovf_dists,
-                                ovf_exp,
-                                ovf_rc,
-                                overflow_ef,
-                                result_ids[ef - 1],
-                                result_dists[ef - 1],
-                                is_expanded[ef - 1]);
-                    }
-
-                    int lo = 0, hi = rc;
-                    while (lo < hi) {
-                        int mid = (lo + hi) / 2;
-                        if (result_dists[mid] < sdist)
-                            lo = mid + 1;
-                        else
-                            hi = mid;
-                    }
-                    int insert_end = rc < ef ? rc : ef - 1;
-                    for (int i = insert_end; i > lo; i--) {
-                        result_ids[i] = result_ids[i - 1];
-                        result_dists[i] = result_dists[i - 1];
-                        is_expanded[i] = is_expanded[i - 1];
-                    }
-                    result_ids[lo] = sid;
-                    result_dists[lo] = sdist;
-                    is_expanded[lo] = 0;
-                    if (rc < ef)
-                        rc++;
-                } else {
-                    overflow_insert(
-                            ovf_ids,
-                            ovf_dists,
-                            ovf_exp,
-                            ovf_rc,
-                            overflow_ef,
-                            sid,
-                            sdist,
-                            0);
+                int lo = 0, hi = rc;
+                while (lo < hi) {
+                    int mid = (lo + hi) / 2;
+                    if (result_dists[mid] < sdist)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
                 }
-            }
-
-            if (rc >= ef) {
-                float new_worst = result_dists[rc - 1];
-                if (new_worst < prev_worst) {
-                    meta[3] = 0;
-                } else {
-                    meta[3] = meta[3] + 1;
+                int insert_end = rc < ef ? rc : ef - 1;
+                for (int i = insert_end; i > lo; i--) {
+                    result_ids[i] = result_ids[i - 1];
+                    result_dists[i] = result_dists[i - 1];
+                    is_expanded[i] = is_expanded[i - 1];
                 }
+                result_ids[lo] = sid;
+                result_dists[lo] = sdist;
+                is_expanded[lo] = 0;
+                if (rc < ef)
+                    rc++;
             }
 
             meta[0] = rc;
-            d_overflow_count[query_idx] = ovf_rc;
         }
         __syncthreads();
 
-        if (meta[3] >= 4)
-            break;
+        // No stagnation detection — run for full max_iterations
+        // (matches gpu-hnsw-sq behavior)
     }
 
     // --- Copy top-k results to global memory ---
@@ -707,7 +655,7 @@ inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0) {
     size += max_staging * sizeof(uint32_t);
     size += max_staging * sizeof(float);
     size += search_width * sizeof(uint32_t);
-    size += 4 * sizeof(int);
+    size += 3 * sizeof(int);
     return size;
 }
 

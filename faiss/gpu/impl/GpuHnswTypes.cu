@@ -88,30 +88,32 @@ void GpuHnswSearchScratch::ensure(
         SCRATCH_CUDA_CHECK(cudaMalloc(&d_visited_bitmaps, need_bm));
         bitmap_bytes = need_bm;
     }
-    size_t ovf_entries = static_cast<size_t>(nq) * overflow_ef;
-    size_t need_ovf =
-            ovf_entries *
-                    (sizeof(uint32_t) + sizeof(float) + sizeof(uint32_t)) +
-            static_cast<size_t>(nq) * sizeof(int);
-    if (need_ovf > overflow_bytes) {
-        if (d_overflow_ids)
-            cudaFree(d_overflow_ids);
-        if (d_overflow_dists)
-            cudaFree(d_overflow_dists);
-        if (d_overflow_expanded)
-            cudaFree(d_overflow_expanded);
-        if (d_overflow_count)
-            cudaFree(d_overflow_count);
-        SCRATCH_CUDA_CHECK(
-                cudaMalloc(&d_overflow_ids, ovf_entries * sizeof(uint32_t)));
-        SCRATCH_CUDA_CHECK(
-                cudaMalloc(&d_overflow_dists, ovf_entries * sizeof(float)));
-        SCRATCH_CUDA_CHECK(cudaMalloc(
-                &d_overflow_expanded, ovf_entries * sizeof(uint32_t)));
-        SCRATCH_CUDA_CHECK(cudaMalloc(
-                &d_overflow_count,
-                static_cast<size_t>(nq) * sizeof(int)));
-        overflow_bytes = need_ovf;
+    if (overflow_ef > 0) {
+        size_t ovf_entries = static_cast<size_t>(nq) * overflow_ef;
+        size_t need_ovf =
+                ovf_entries *
+                        (sizeof(uint32_t) + sizeof(float) + sizeof(uint32_t)) +
+                static_cast<size_t>(nq) * sizeof(int);
+        if (need_ovf > overflow_bytes) {
+            if (d_overflow_ids)
+                cudaFree(d_overflow_ids);
+            if (d_overflow_dists)
+                cudaFree(d_overflow_dists);
+            if (d_overflow_expanded)
+                cudaFree(d_overflow_expanded);
+            if (d_overflow_count)
+                cudaFree(d_overflow_count);
+            SCRATCH_CUDA_CHECK(cudaMalloc(
+                    &d_overflow_ids, ovf_entries * sizeof(uint32_t)));
+            SCRATCH_CUDA_CHECK(cudaMalloc(
+                    &d_overflow_dists, ovf_entries * sizeof(float)));
+            SCRATCH_CUDA_CHECK(cudaMalloc(
+                    &d_overflow_expanded, ovf_entries * sizeof(uint32_t)));
+            SCRATCH_CUDA_CHECK(cudaMalloc(
+                    &d_overflow_count,
+                    static_cast<size_t>(nq) * sizeof(int)));
+            overflow_bytes = need_ovf;
+        }
     }
 }
 
