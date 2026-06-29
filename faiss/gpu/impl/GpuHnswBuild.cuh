@@ -121,6 +121,7 @@ inline void extract_faiss_hnsw_layers(
                 h_node_ids.data(),
                 ul.num_nodes * sizeof(uint32_t),
                 cudaMemcpyHostToDevice));
+        std::vector<uint32_t>().swap(h_node_ids);
 
         GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(
                 &ul.d_neighbors, ul.num_nodes * maxM * sizeof(uint32_t)));
@@ -129,6 +130,7 @@ inline void extract_faiss_hnsw_layers(
                 h_neighbors.data(),
                 ul.num_nodes * maxM * sizeof(uint32_t),
                 cudaMemcpyHostToDevice));
+        std::vector<uint32_t>().swap(h_neighbors);
     }
 }
 
@@ -172,6 +174,7 @@ inline void upload_graph_to_gpu(
             h_layer0_flat.data(),
             graph0_bytes,
             cudaMemcpyHostToDevice));
+    std::vector<uint32_t>().swap(h_layer0_flat);
 
     int num_upper = static_cast<int>(idx.upper_layers.size());
     idx.num_upper_layers_built = num_upper;
@@ -211,6 +214,7 @@ inline void upload_fp32_dataset(
             h_vectors.data(),
             dataset_bytes,
             cudaMemcpyHostToDevice));
+    std::vector<float>().swap(h_vectors);
     idx.dataset_int8 = false;
 }
 
@@ -235,6 +239,15 @@ inline void upload_int8_dataset(
             cudaMemcpyHostToDevice));
     idx.dataset_int8 = true;
 
+    // Free staging buffer before computing norms (reuse signed_codes
+    // pointer below from device memory is not needed — norms read
+    // from the local copy before swap).
+    // Actually we still need signed_codes for cosine norm computation.
+    // Defer swap until after norms are computed.
+    if (!is_cosine) {
+        std::vector<int8_t>().swap(signed_codes);
+    }
+
     if (is_cosine) {
         std::vector<float> h_inv_norms(n_rows);
         for (int64_t i = 0; i < n_rows; i++) {
@@ -254,6 +267,7 @@ inline void upload_int8_dataset(
                 h_inv_norms.data(),
                 norms_bytes,
                 cudaMemcpyHostToDevice));
+        std::vector<int8_t>().swap(signed_codes);
     }
 }
 
