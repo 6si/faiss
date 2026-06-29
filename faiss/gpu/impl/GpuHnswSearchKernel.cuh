@@ -77,10 +77,11 @@ __device__ __forceinline__ float thread_ip_distance(
 // ============================================================================
 
 __device__ __forceinline__ int select_threads_per_dist(int dim) {
-    if (dim >= 256)
-        return 4;
-    if (dim >= 96)
-        return 2;
+    // Always use 1 thread per distance: 128 concurrent distances per block
+    // vs 32 with 4-thread cooperative. For int8 dim=384, each vector is only
+    // 384 bytes — fits in L1 cache. The 4x concurrency gain outweighs the
+    // cooperative memory coalescing benefit at this data size.
+    (void)dim;
     return 1;
 }
 
