@@ -60,30 +60,6 @@ __device__ __forceinline__ float thread_l2_distance(
     return sum;
 }
 
-// int8_t specialization: vectorized char4 loads (4 bytes per load vs 1)
-// dim must be divisible by 4 (true for all practical dimensions)
-template <>
-__device__ __forceinline__ float thread_l2_distance<int8_t>(
-        const float* __restrict__ query,
-        const int8_t* __restrict__ vec,
-        int dim) {
-    float sum = 0.0f;
-    int d = 0;
-    for (; d + 3 < dim; d += 4) {
-        char4 v4 = __ldg(reinterpret_cast<const char4*>(vec + d));
-        float d0 = query[d] - static_cast<float>(v4.x);
-        float d1 = query[d + 1] - static_cast<float>(v4.y);
-        float d2 = query[d + 2] - static_cast<float>(v4.z);
-        float d3 = query[d + 3] - static_cast<float>(v4.w);
-        sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
-    }
-    for (; d < dim; d++) {
-        float diff = query[d] - static_cast<float>(__ldg(&vec[d]));
-        sum += diff * diff;
-    }
-    return sum;
-}
-
 template <typename DataT>
 __device__ __forceinline__ float thread_ip_distance(
         const float* __restrict__ query,
@@ -92,27 +68,6 @@ __device__ __forceinline__ float thread_ip_distance(
     float sum = 0.0f;
     for (int d = 0; d < dim; d++) {
         sum += query[d] * load_elem(vec, d);
-    }
-    return -sum;
-}
-
-// int8_t specialization: vectorized char4 loads
-template <>
-__device__ __forceinline__ float thread_ip_distance<int8_t>(
-        const float* __restrict__ query,
-        const int8_t* __restrict__ vec,
-        int dim) {
-    float sum = 0.0f;
-    int d = 0;
-    for (; d + 3 < dim; d += 4) {
-        char4 v4 = __ldg(reinterpret_cast<const char4*>(vec + d));
-        sum += query[d] * static_cast<float>(v4.x) +
-                query[d + 1] * static_cast<float>(v4.y) +
-                query[d + 2] * static_cast<float>(v4.z) +
-                query[d + 3] * static_cast<float>(v4.w);
-    }
-    for (; d < dim; d++) {
-        sum += query[d] * static_cast<float>(__ldg(&vec[d]));
     }
     return -sum;
 }
