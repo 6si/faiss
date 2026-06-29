@@ -619,8 +619,7 @@ __global__ void layer0_beam_search_kernel(
         }
         __syncthreads();
 
-        // No stagnation detection — run for full max_iterations
-        // (matches gpu-hnsw-sq behavior)
+        // Stagnation detected when num_parents==0 (all expanded) → break above
     }
 
     // --- Copy top-k results to global memory ---
