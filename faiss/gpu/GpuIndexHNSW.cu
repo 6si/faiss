@@ -106,7 +106,9 @@ void GpuIndexHNSW::searchImpl_(
     FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
 
     auto& idx = *deviceIndex_;
-    cudaStream_t stream = resources_->getDefaultStream(config_.device);
+    cudaStream_t stream = idx.search_stream
+            ? idx.search_stream
+            : resources_->getDefaultStream(config_.device);
 
     GpuHnswSearchParams sp;
     bool got_params = false;
@@ -132,22 +134,8 @@ void GpuIndexHNSW::searchImpl_(
             sp.thread_block_size = params->thread_block_size;
             sp.overflow_factor = params->overflow_factor;
             got_params = true;
-        } else {
-            fprintf(stderr,
-                    "[gpu_hnsw] WARNING: dynamic_cast<SearchParametersGpuHNSW>"
-                    " failed, using default ef=%d\n",
-                    sp.ef);
-            fflush(stderr);
         }
     }
-
-    fprintf(stderr,
-            "[gpu_hnsw] searchImpl_ nq=%d k=%d ef=%d src=%s\n",
-            static_cast<int>(n),
-            k,
-            sp.ef,
-            got_params ? "direct" : "default");
-    fflush(stderr);
 
     std::lock_guard<std::mutex> lock(idx.scratch_mutex);
     auto& sc = idx.scratch;
@@ -216,7 +204,9 @@ void GpuIndexHNSW::searchHost(
     GPU_HNSW_CUDA_CHECK(cudaSetDevice(config_.device));
     DeviceScope scope(config_.device);
     auto& idx = *deviceIndex_;
-    cudaStream_t stream = resources_->getDefaultStream(config_.device);
+    cudaStream_t stream = idx.search_stream
+            ? idx.search_stream
+            : resources_->getDefaultStream(config_.device);
 
     std::lock_guard<std::mutex> lock(idx.scratch_mutex);
     auto& sc = idx.scratch;

@@ -93,6 +93,8 @@ struct GpuHnswDeviceIndex {
     void* d_upper_layer_ptrs = nullptr;
     int num_upper_layers_built = 0;
 
+    cudaStream_t search_stream = nullptr;
+
     mutable std::mutex scratch_mutex;
     mutable GpuHnswSearchScratch scratch;
 

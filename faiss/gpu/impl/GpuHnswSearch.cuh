@@ -59,23 +59,9 @@ inline void gpu_hnsw_search(
     int sw = params.search_width;
     int overflow_ef = params.overflow_factor * ef;
     int max_iter = params.max_iterations > 0 ? params.max_iterations
-                                             : (ef + overflow_ef) / sw + 20;
+                                             : 2 * ef / sw + 10;
     int dim = static_cast<int>(idx.dim);
     int num_upper_layers = idx.num_upper_layers_built;
-
-    fprintf(stderr,
-            "[gpu_hnsw_search] ef=%d sw=%d overflow_ef=%d max_iter=%d "
-            "N=%ld dim=%d max_degree0=%d use_ip=%d upper_layers=%d\n",
-            ef,
-            sw,
-            overflow_ef,
-            max_iter,
-            static_cast<long>(idx.n_rows),
-            dim,
-            idx.max_degree0,
-            static_cast<int>(idx.use_ip),
-            num_upper_layers);
-    fflush(stderr);
 
     auto launch_kernels = [&]<typename DataT>(
                                   const DataT* d_data,
@@ -119,11 +105,6 @@ inline void gpu_hnsw_search(
             int smem_overhead = sw * idx.max_degree0 * 8 + sw * 4 + 12;
             int max_ef = (49152 - smem_overhead) / 12;
             if (ef > max_ef) {
-                fprintf(stderr,
-                        "[gpu_hnsw] clamping ef %d -> %d (smem limit)\n",
-                        ef,
-                        max_ef);
-                fflush(stderr);
                 ef = max_ef;
             }
         }

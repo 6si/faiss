@@ -137,6 +137,8 @@ GpuHnswSearchScratch::~GpuHnswSearchScratch() {
 }
 
 GpuHnswDeviceIndex::~GpuHnswDeviceIndex() {
+    if (search_stream)
+        cudaStreamDestroy(search_stream);
     if (d_dataset)
         cudaFree(d_dataset);
     if (d_inv_norms)
