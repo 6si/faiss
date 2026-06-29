@@ -37,7 +37,7 @@ struct GpuHnswSearchParams {
     int search_width = 4;
     int max_iterations = 0;
     int thread_block_size = 0;
-    int overflow_factor = 2;
+    int overflow_factor = 1;
 };
 
 struct GpuHnswDeviceUpperLayer {
