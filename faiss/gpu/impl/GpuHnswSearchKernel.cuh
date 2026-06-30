@@ -53,6 +53,7 @@ __device__ __forceinline__ float thread_l2_distance(
         const DataT* __restrict__ vec,
         int dim) {
     float sum = 0.0f;
+#pragma unroll 8
     for (int d = 0; d < dim; d++) {
         float diff = query[d] - load_elem(vec, d);
         sum += diff * diff;
@@ -66,6 +67,7 @@ __device__ __forceinline__ float thread_ip_distance(
         const DataT* __restrict__ vec,
         int dim) {
     float sum = 0.0f;
+#pragma unroll 8
     for (int d = 0; d < dim; d++) {
         sum += query[d] * load_elem(vec, d);
     }
@@ -211,10 +213,10 @@ __global__ void upper_layer_search_kernel(
             float best_nbr_dist = best_dist;
 
             for (uint32_t j = lane; j < lp.max_degree; j += 32) {
-                uint32_t nbr = __ldg(&lp.d_neighbors
+                uint32_t nbr = lp.d_neighbors
                                               [static_cast<int64_t>(local_idx) *
                                                        lp.max_degree +
-                                               j]);
+                                               j];
                 float dist = FLT_MAX;
                 if (nbr != UINT32_MAX) {
                     const DataT* nbr_vec =
@@ -222,7 +224,7 @@ __global__ void upper_layer_search_kernel(
                     if (use_inner_product) {
                         dist = thread_ip_distance(query, nbr_vec, dim);
                         if (d_inv_norms)
-                            dist *= __ldg(&d_inv_norms[nbr]);
+                            dist *= d_inv_norms[nbr];
                     } else {
                         dist = thread_l2_distance(query, nbr_vec, dim);
                     }
@@ -405,8 +407,8 @@ __global__ void layer0_beam_search_kernel(
     __syncthreads();
 
     for (int j = threadIdx.x; j < max_degree0; j += blockDim.x) {
-        uint32_t nbr = __ldg(
-                &d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j]);
+        uint32_t nbr =
+                d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j];
         if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
             continue;
         if (!bitmap_visit(visited_bmap, nbr))
@@ -417,7 +419,7 @@ __global__ void layer0_beam_search_kernel(
         if (use_inner_product) {
             dist = thread_ip_distance(query, nbr_vec, dim);
             if (d_inv_norms)
-                dist *= __ldg(&d_inv_norms[nbr]);
+                dist *= d_inv_norms[nbr];
         } else {
             dist = thread_l2_distance(query, nbr_vec, dim);
         }
@@ -513,9 +515,9 @@ __global__ void layer0_beam_search_kernel(
 
             uint32_t parent = parent_ids[parent_idx];
             uint32_t nbr =
-                    __ldg(&d_layer0_graph
+                    d_layer0_graph
                                   [static_cast<int64_t>(parent) * max_degree0 +
-                                   nbr_slot]);
+                                   nbr_slot];
             if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
                 continue;
             if (!bitmap_visit(visited_bmap, nbr))
@@ -526,7 +528,7 @@ __global__ void layer0_beam_search_kernel(
             if (use_inner_product) {
                 dist = thread_ip_distance(query, nbr_vec, dim);
                 if (d_inv_norms)
-                    dist *= __ldg(&d_inv_norms[nbr]);
+                    dist *= d_inv_norms[nbr];
             } else {
                 dist = thread_l2_distance(query, nbr_vec, dim);
             }

@@ -21,8 +21,9 @@
  * limitations under the License.
  */
 
-#include <faiss/IndexHNSW.h>
 #include <faiss/IndexScalarQuantizer.h>
+#include <faiss/cppcontrib/knowhere/IndexCosine.h>
+#include <faiss/cppcontrib/knowhere/IndexHNSW.h>
 #include <faiss/gpu/GpuIndexHNSW.h>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
 #include <faiss/gpu/utils/DeviceUtils.h>
@@ -48,7 +49,8 @@ GpuIndexHNSW::GpuIndexHNSW(
 
 GpuIndexHNSW::~GpuIndexHNSW() = default;
 
-void GpuIndexHNSW::copyFrom(const faiss::IndexHNSW* index) {
+void GpuIndexHNSW::copyFrom(
+        const faiss::cppcontrib::knowhere::IndexHNSW* index) {
     FAISS_THROW_IF_NOT_MSG(index, "index must not be null");
     FAISS_THROW_IF_NOT_MSG(index->ntotal > 0, "index must not be empty");
 
@@ -58,8 +60,35 @@ void GpuIndexHNSW::copyFrom(const faiss::IndexHNSW* index) {
     this->metric_type = index->metric_type;
     this->ntotal = index->ntotal;
 
-    bool use_ip = (index->metric_type == faiss::METRIC_INNER_PRODUCT);
-    bool is_cosine = false;
+    // Detect cosine from index type (IndexHNSWFlatCosine / IndexHNSWSQCosine
+    // implement HasInverseL2Norms).
+    bool is_cosine =
+            dynamic_cast<const faiss::cppcontrib::knowhere::HasInverseL2Norms*>(
+                    index) != nullptr;
+    bool use_ip =
+            is_cosine || (index->metric_type == faiss::METRIC_INNER_PRODUCT);
+
+    if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
+        deviceIndex_ = from_faiss_hnsw_sq(*index, use_ip, is_cosine);
+    } else {
+        deviceIndex_ = from_faiss_hnsw_flat(*index, use_ip, is_cosine);
+    }
+
+    this->is_trained = true;
+}
+
+void GpuIndexHNSW::copyFromWithMetric(
+        const faiss::cppcontrib::knowhere::IndexHNSW* index,
+        bool use_ip,
+        bool is_cosine) {
+    FAISS_THROW_IF_NOT_MSG(index, "index must not be null");
+    FAISS_THROW_IF_NOT_MSG(index->ntotal > 0, "index must not be empty");
+
+    DeviceScope scope(config_.device);
+
+    this->d = index->d;
+    this->metric_type = index->metric_type;
+    this->ntotal = index->ntotal;
 
     if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
         deviceIndex_ = from_faiss_hnsw_sq(*index, use_ip, is_cosine);
@@ -76,8 +105,7 @@ void GpuIndexHNSW::reset() {
     this->is_trained = false;
 }
 
-void GpuIndexHNSW::setSearchParams(
-        const GpuHnswSearchParams& params) const {
+void GpuIndexHNSW::setSearchParams(const GpuHnswSearchParams& params) const {
     std::lock_guard<std::mutex> lock(searchParamsMutex_);
     directSearchParams_ = params;
     hasDirectSearchParams_ = true;
@@ -155,8 +183,6 @@ void GpuIndexHNSW::searchImpl_(
 
     gpu_hnsw_search(stream, sp, idx, nq, k);
 
-    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
-
     // D2D: distances (output is a device pointer from GpuIndex::search)
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             distances,
@@ -167,11 +193,13 @@ void GpuIndexHNSW::searchImpl_(
 
     // Labels: D2H stage (uint64_t→idx_t conversion), then H2D back
     auto tmp = std::make_unique<uint64_t[]>(nq * k);
-    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             tmp.get(),
             sc.d_neighbors,
             static_cast<size_t>(nq) * k * sizeof(uint64_t),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost,
+            stream));
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto h_labels = std::make_unique<idx_t[]>(nq * k);
     for (int i = 0; i < nq * k; i++) {
@@ -226,22 +254,24 @@ void GpuIndexHNSW::searchHost(
 
     gpu_hnsw_search(stream, sp, idx, nq, k);
 
-    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // D2H: distances directly to host output
-    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+    // D2H: distances via async copy on the search stream
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             distances_host,
             sc.d_distances,
             static_cast<size_t>(nq) * k * sizeof(float),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost,
+            stream));
 
     // D2H: labels with uint64_t → idx_t conversion
     auto tmp = std::make_unique<uint64_t[]>(nq * k);
-    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             tmp.get(),
             sc.d_neighbors,
             static_cast<size_t>(nq) * k * sizeof(uint64_t),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost,
+            stream));
+
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
 
     for (int i = 0; i < nq * k; i++) {
         labels_host[i] =
