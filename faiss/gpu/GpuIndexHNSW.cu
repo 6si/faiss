@@ -134,9 +134,6 @@ void GpuIndexHNSW::searchImpl_(
     FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
 
     auto& idx = *deviceIndex_;
-    cudaStream_t stream = idx.search_stream
-            ? idx.search_stream
-            : resources_->getDefaultStream(config_.device);
 
     GpuHnswSearchParams sp;
     bool got_params = false;
@@ -165,8 +162,10 @@ void GpuIndexHNSW::searchImpl_(
         }
     }
 
-    std::lock_guard<std::mutex> lock(idx.scratch_mutex);
-    auto& sc = idx.scratch;
+    ScratchPoolGuard guard(*idx.scratch_pool);
+    auto* slot = guard.get();
+    auto& sc = slot->scratch;
+    cudaStream_t stream = slot->stream;
 
     int nq = static_cast<int>(n);
     int dim = static_cast<int>(idx.dim);
@@ -227,24 +226,20 @@ void GpuIndexHNSW::searchHost(
             "Index not loaded. Call copyFrom() first.");
     FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
 
-    // Ensure CUDA context is active on this thread (Folly worker threads
-    // may not have set a device yet).
     GPU_HNSW_CUDA_CHECK(cudaSetDevice(config_.device));
     DeviceScope scope(config_.device);
     auto& idx = *deviceIndex_;
-    cudaStream_t stream = idx.search_stream
-            ? idx.search_stream
-            : resources_->getDefaultStream(config_.device);
 
-    std::lock_guard<std::mutex> lock(idx.scratch_mutex);
-    auto& sc = idx.scratch;
+    ScratchPoolGuard guard(*idx.scratch_pool);
+    auto* slot = guard.get();
+    auto& sc = slot->scratch;
+    cudaStream_t stream = slot->stream;
 
     int nq = static_cast<int>(n);
     int dim = static_cast<int>(idx.dim);
     int overflow_ef = sp.overflow_factor * sp.ef;
     sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), overflow_ef);
 
-    // Copy query vectors to scratch (auto-detect host or device source)
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             sc.d_queries,
             x_host,
@@ -254,7 +249,6 @@ void GpuIndexHNSW::searchHost(
 
     gpu_hnsw_search(stream, sp, idx, nq, k);
 
-    // D2H: distances via async copy on the search stream
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             distances_host,
             sc.d_distances,
@@ -262,7 +256,6 @@ void GpuIndexHNSW::searchHost(
             cudaMemcpyDeviceToHost,
             stream));
 
-    // D2H: labels with uint64_t → idx_t conversion
     auto tmp = std::make_unique<uint64_t[]>(nq * k);
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             tmp.get(),

@@ -25,7 +25,9 @@
 
 #include <cuda_runtime.h>
 
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -75,6 +77,59 @@ struct GpuHnswSearchScratch {
     GpuHnswSearchScratch& operator=(const GpuHnswSearchScratch&) = delete;
 };
 
+/// One slot in the scratch pool: a scratch buffer + its own CUDA stream.
+struct GpuHnswScratchSlot {
+    GpuHnswSearchScratch scratch;
+    cudaStream_t stream = nullptr;
+
+    ~GpuHnswScratchSlot();
+    GpuHnswScratchSlot() = default;
+    GpuHnswScratchSlot(const GpuHnswScratchSlot&) = delete;
+    GpuHnswScratchSlot& operator=(const GpuHnswScratchSlot&) = delete;
+};
+
+/// Pool of scratch buffers allowing concurrent GPU searches on the same segment.
+/// Each acquire() returns a slot with its own scratch + CUDA stream.
+/// Callers block if all slots are in use.
+class GpuHnswScratchPool {
+ public:
+    /// Create a pool with `pool_size` slots on the given CUDA device.
+    explicit GpuHnswScratchPool(int pool_size = 4, int device = 0);
+    ~GpuHnswScratchPool() = default;
+
+    GpuHnswScratchPool(const GpuHnswScratchPool&) = delete;
+    GpuHnswScratchPool& operator=(const GpuHnswScratchPool&) = delete;
+
+    /// Acquire a scratch slot (blocks until one is available).
+    GpuHnswScratchSlot* acquire();
+    /// Release a previously acquired scratch slot back to the pool.
+    void release(GpuHnswScratchSlot* slot);
+
+    int pool_size() const { return static_cast<int>(slots_.size()); }
+
+ private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<std::unique_ptr<GpuHnswScratchSlot>> slots_;
+    std::vector<GpuHnswScratchSlot*> available_;
+};
+
+/// RAII guard: acquires a scratch slot on construction, releases on destruction.
+class ScratchPoolGuard {
+ public:
+    ScratchPoolGuard(GpuHnswScratchPool& pool)
+            : pool_(pool), slot_(pool.acquire()) {}
+    ~ScratchPoolGuard() { pool_.release(slot_); }
+    GpuHnswScratchSlot* get() const { return slot_; }
+
+    ScratchPoolGuard(const ScratchPoolGuard&) = delete;
+    ScratchPoolGuard& operator=(const ScratchPoolGuard&) = delete;
+
+ private:
+    GpuHnswScratchPool& pool_;
+    GpuHnswScratchSlot* slot_;
+};
+
 struct GpuHnswDeviceIndex {
     void* d_dataset = nullptr;
     bool dataset_int8 = false;
@@ -93,10 +148,7 @@ struct GpuHnswDeviceIndex {
     void* d_upper_layer_ptrs = nullptr;
     int num_upper_layers_built = 0;
 
-    cudaStream_t search_stream = nullptr;
-
-    mutable std::mutex scratch_mutex;
-    mutable GpuHnswSearchScratch scratch;
+    mutable std::unique_ptr<GpuHnswScratchPool> scratch_pool;
 
     ~GpuHnswDeviceIndex();
 };

@@ -138,9 +138,41 @@ GpuHnswSearchScratch::~GpuHnswSearchScratch() {
         cudaFree(d_overflow_count);
 }
 
+GpuHnswScratchSlot::~GpuHnswScratchSlot() {
+    if (stream)
+        cudaStreamDestroy(stream);
+}
+
+GpuHnswScratchPool::GpuHnswScratchPool(int pool_size, int device) {
+    slots_.reserve(pool_size);
+    available_.reserve(pool_size);
+    for (int i = 0; i < pool_size; i++) {
+        auto slot = std::make_unique<GpuHnswScratchSlot>();
+        SCRATCH_CUDA_CHECK(cudaSetDevice(device));
+        SCRATCH_CUDA_CHECK(
+                cudaStreamCreateWithFlags(&slot->stream, cudaStreamNonBlocking));
+        available_.push_back(slot.get());
+        slots_.push_back(std::move(slot));
+    }
+}
+
+GpuHnswScratchSlot* GpuHnswScratchPool::acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this] { return !available_.empty(); });
+    auto* slot = available_.back();
+    available_.pop_back();
+    return slot;
+}
+
+void GpuHnswScratchPool::release(GpuHnswScratchSlot* slot) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        available_.push_back(slot);
+    }
+    cv_.notify_one();
+}
+
 GpuHnswDeviceIndex::~GpuHnswDeviceIndex() {
-    if (search_stream)
-        cudaStreamDestroy(search_stream);
     if (d_dataset)
         cudaFree(d_dataset);
     if (d_inv_norms)
