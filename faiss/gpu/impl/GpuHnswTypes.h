@@ -93,7 +93,7 @@ struct GpuHnswScratchSlot {
 /// Callers block if all slots are in use.
 class GpuHnswScratchPool {
  public:
-    /// Create a pool with `pool_size` slots on the given CUDA device.
+    /// Create a pool. CUDA streams are allocated lazily on first acquire().
     explicit GpuHnswScratchPool(int pool_size = 4, int device = 0);
     ~GpuHnswScratchPool() = default;
 
@@ -105,11 +105,16 @@ class GpuHnswScratchPool {
     /// Release a previously acquired scratch slot back to the pool.
     void release(GpuHnswScratchSlot* slot);
 
-    int pool_size() const { return static_cast<int>(slots_.size()); }
+    int pool_size() const { return pool_size_; }
 
  private:
+    void init_once();
+
     std::mutex mutex_;
     std::condition_variable cv_;
+    int pool_size_;
+    int device_;
+    bool initialized_ = false;
     std::vector<std::unique_ptr<GpuHnswScratchSlot>> slots_;
     std::vector<GpuHnswScratchSlot*> available_;
 };
