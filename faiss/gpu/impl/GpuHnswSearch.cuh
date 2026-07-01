@@ -52,9 +52,9 @@ inline void gpu_hnsw_search(
         cudaStream_t stream,
         const GpuHnswSearchParams& params,
         const GpuHnswDeviceIndex& idx,
+        GpuHnswSearchScratch& sc,
         int num_queries,
         int k) {
-    auto& sc = idx.scratch;
 
     int ef = params.ef;
     int sw = params.search_width;

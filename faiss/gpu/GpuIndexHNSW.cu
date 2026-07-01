@@ -180,7 +180,7 @@ void GpuIndexHNSW::searchImpl_(
             cudaMemcpyDeviceToDevice,
             stream));
 
-    gpu_hnsw_search(stream, sp, idx, nq, k);
+    gpu_hnsw_search(stream, sp, idx, sc, nq, k);
 
     // D2D: distances (output is a device pointer from GpuIndex::search)
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
@@ -247,7 +247,7 @@ void GpuIndexHNSW::searchHost(
             cudaMemcpyDefault,
             stream));
 
-    gpu_hnsw_search(stream, sp, idx, nq, k);
+    gpu_hnsw_search(stream, sp, idx, sc, nq, k);
 
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             distances_host,
