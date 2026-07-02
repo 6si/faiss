@@ -28,6 +28,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <type_traits>
 
 namespace faiss {
 namespace gpu {
@@ -72,6 +73,104 @@ __device__ __forceinline__ float thread_ip_distance(
         sum += query[d] * load_elem(vec, d);
     }
     return -sum;
+}
+
+// ============================================================================
+// INT8 dp4a distance: uses __dp4a intrinsic for 4x fewer instructions.
+// Query must be pre-quantized to int8 in shared memory.
+// ============================================================================
+
+__device__ __forceinline__ float dp4a_ip_distance(
+        const int32_t* __restrict__ query_packed,
+        const int8_t* __restrict__ vec,
+        int dim) {
+    int sum = 0;
+    int dim4 = dim >> 2;
+    const int32_t* vec_packed = reinterpret_cast<const int32_t*>(vec);
+#pragma unroll 8
+    for (int i = 0; i < dim4; i++) {
+        sum = __dp4a(__ldg(&vec_packed[i]), query_packed[i], sum);
+    }
+    return static_cast<float>(-sum);
+}
+
+__device__ __forceinline__ float dp4a_l2_distance(
+        const int32_t* __restrict__ query_packed,
+        const int8_t* __restrict__ vec,
+        int dim) {
+    int sum = 0;
+    int dim4 = dim >> 2;
+    const int32_t* vec_packed = reinterpret_cast<const int32_t*>(vec);
+#pragma unroll 8
+    for (int i = 0; i < dim4; i++) {
+        int32_t q = query_packed[i];
+        int32_t v = __ldg(&vec_packed[i]);
+        // Compute (q-v) element-wise, then dot with itself
+        int8_t q0 = static_cast<int8_t>(q & 0xFF);
+        int8_t q1 = static_cast<int8_t>((q >> 8) & 0xFF);
+        int8_t q2 = static_cast<int8_t>((q >> 16) & 0xFF);
+        int8_t q3 = static_cast<int8_t>((q >> 24) & 0xFF);
+        int8_t v0 = static_cast<int8_t>(v & 0xFF);
+        int8_t v1 = static_cast<int8_t>((v >> 8) & 0xFF);
+        int8_t v2 = static_cast<int8_t>((v >> 16) & 0xFF);
+        int8_t v3 = static_cast<int8_t>((v >> 24) & 0xFF);
+        int d0 = q0 - v0;
+        int d1 = q1 - v1;
+        int d2 = q2 - v2;
+        int d3 = q3 - v3;
+        sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+    }
+    return static_cast<float>(sum);
+}
+
+/// Quantize a float query to int8 in shared memory. All threads cooperate.
+/// Returns the scale factor: query_float ≈ scale * query_int8.
+/// For ranking (IP/L2), the scale is constant across all vectors and can be
+/// ignored — only relative ordering matters.
+__device__ __forceinline__ float quantize_query_to_smem(
+        const float* __restrict__ query_global,
+        float* __restrict__ s_query_float,
+        int8_t* __restrict__ s_query_int8,
+        int dim,
+        int block_size) {
+    // Phase 1: cooperatively load query into shared memory and find max abs
+    __shared__ float s_max_abs;
+    if (threadIdx.x == 0)
+        s_max_abs = 0.0f;
+    __syncthreads();
+
+    float local_max = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += block_size) {
+        float val = query_global[d];
+        s_query_float[d] = val;
+        float abs_val = fabsf(val);
+        if (abs_val > local_max)
+            local_max = abs_val;
+    }
+    // Warp-reduce max
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, local_max, offset);
+        if (other > local_max)
+            local_max = other;
+    }
+    if ((threadIdx.x & 31) == 0) {
+        atomicMax(reinterpret_cast<int*>(&s_max_abs),
+                  __float_as_int(local_max));
+    }
+    __syncthreads();
+
+    // Phase 2: quantize to int8
+    float scale = s_max_abs / 127.0f;
+    float inv_scale = (s_max_abs > 0.0f) ? 127.0f / s_max_abs : 0.0f;
+    for (int d = threadIdx.x; d < dim; d += block_size) {
+        float val = s_query_float[d];
+        int q = __float2int_rn(val * inv_scale);
+        q = max(-127, min(127, q));
+        s_query_int8[d] = static_cast<int8_t>(q);
+    }
+    __syncthreads();
+
+    return scale;
 }
 
 // ============================================================================
@@ -336,13 +435,26 @@ __global__ void layer0_beam_search_kernel(
     if (query_idx >= num_queries)
         return;
 
-    const float* query = d_queries + static_cast<int64_t>(query_idx) * dim;
+    const float* query_global =
+            d_queries + static_cast<int64_t>(query_idx) * dim;
 
     extern __shared__ char smem[];
 
     int max_staging = search_width * max_degree0;
 
-    uint32_t* result_ids = reinterpret_cast<uint32_t*>(smem);
+    // Shared memory layout: query cache first, then beam search state.
+    // Align int8 query to 4 bytes for dp4a packed reads.
+    int dim4_aligned = ((dim + 3) / 4) * 4;
+    float* s_query_float = reinterpret_cast<float*>(smem);
+    int8_t* s_query_int8 = reinterpret_cast<int8_t*>(
+            s_query_float + dim);
+    // Align the next section to 4 bytes after int8 query
+    char* beam_base = reinterpret_cast<char*>(s_query_int8 + dim4_aligned);
+    // Round up to 4-byte alignment
+    beam_base = reinterpret_cast<char*>(
+            (reinterpret_cast<uintptr_t>(beam_base) + 3) & ~uintptr_t(3));
+
+    uint32_t* result_ids = reinterpret_cast<uint32_t*>(beam_base);
     float* result_dists = reinterpret_cast<float*>(result_ids + ef);
     uint32_t* is_expanded = reinterpret_cast<uint32_t*>(result_dists + ef);
     uint32_t* staging_ids = is_expanded + ef;
@@ -350,6 +462,14 @@ __global__ void layer0_beam_search_kernel(
     uint32_t* parent_ids =
             reinterpret_cast<uint32_t*>(staging_dists + max_staging);
     int* meta = reinterpret_cast<int*>(parent_ids + search_width);
+
+    // Cache query in shared memory + quantize to int8 for dp4a
+    float q_scale = quantize_query_to_smem(
+            query_global, s_query_float, s_query_int8, dim, blockDim.x);
+    const float* query = s_query_float;
+    const int32_t* query_int8_packed =
+            reinterpret_cast<const int32_t*>(s_query_int8);
+    (void)q_scale; // scale not needed for ranking
 
     int bitmap_words = (N + 31) / 32;
     uint32_t* visited_bmap =
@@ -384,14 +504,27 @@ __global__ void layer0_beam_search_kernel(
     uint32_t ep = d_entry_points[query_idx];
     if (threadIdx.x == 0) {
         float ep_dist;
+        const auto* ep_vec = d_dataset + static_cast<int64_t>(ep) * dim;
         if (use_inner_product) {
-            ep_dist = thread_ip_distance(
-                    query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
+            if constexpr (std::is_same_v<DataT, int8_t>) {
+                ep_dist = dp4a_ip_distance(
+                        query_int8_packed,
+                        reinterpret_cast<const int8_t*>(ep_vec),
+                        dim);
+            } else {
+                ep_dist = thread_ip_distance(query, ep_vec, dim);
+            }
             if (d_inv_norms)
                 ep_dist *= __ldg(&d_inv_norms[ep]);
         } else {
-            ep_dist = thread_l2_distance(
-                    query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
+            if constexpr (std::is_same_v<DataT, int8_t>) {
+                ep_dist = dp4a_l2_distance(
+                        query_int8_packed,
+                        reinterpret_cast<const int8_t*>(ep_vec),
+                        dim);
+            } else {
+                ep_dist = thread_l2_distance(query, ep_vec, dim);
+            }
         }
         result_ids[0] = ep;
         result_dists[0] = ep_dist;
@@ -417,11 +550,25 @@ __global__ void layer0_beam_search_kernel(
         const DataT* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
         float dist;
         if (use_inner_product) {
-            dist = thread_ip_distance(query, nbr_vec, dim);
+            if constexpr (std::is_same_v<DataT, int8_t>) {
+                dist = dp4a_ip_distance(
+                        query_int8_packed,
+                        reinterpret_cast<const int8_t*>(nbr_vec),
+                        dim);
+            } else {
+                dist = thread_ip_distance(query, nbr_vec, dim);
+            }
             if (d_inv_norms)
                 dist *= d_inv_norms[nbr];
         } else {
-            dist = thread_l2_distance(query, nbr_vec, dim);
+            if constexpr (std::is_same_v<DataT, int8_t>) {
+                dist = dp4a_l2_distance(
+                        query_int8_packed,
+                        reinterpret_cast<const int8_t*>(nbr_vec),
+                        dim);
+            } else {
+                dist = thread_l2_distance(query, nbr_vec, dim);
+            }
         }
 
         int slot = atomicAdd(&meta[1], 1);
@@ -526,11 +673,25 @@ __global__ void layer0_beam_search_kernel(
             const DataT* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
             float dist;
             if (use_inner_product) {
-                dist = thread_ip_distance(query, nbr_vec, dim);
+                if constexpr (std::is_same_v<DataT, int8_t>) {
+                    dist = dp4a_ip_distance(
+                            query_int8_packed,
+                            reinterpret_cast<const int8_t*>(nbr_vec),
+                            dim);
+                } else {
+                    dist = thread_ip_distance(query, nbr_vec, dim);
+                }
                 if (d_inv_norms)
                     dist *= d_inv_norms[nbr];
             } else {
-                dist = thread_l2_distance(query, nbr_vec, dim);
+                if constexpr (std::is_same_v<DataT, int8_t>) {
+                    dist = dp4a_l2_distance(
+                            query_int8_packed,
+                            reinterpret_cast<const int8_t*>(nbr_vec),
+                            dim);
+                } else {
+                    dist = thread_l2_distance(query, nbr_vec, dim);
+                }
             }
 
             int slot = atomicAdd(&meta[1], 1);
@@ -594,17 +755,30 @@ __global__ void layer0_beam_search_kernel(
     }
 }
 
-inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0) {
+inline size_t calc_layer0_smem_size(
+        int ef,
+        int search_width,
+        int max_degree0,
+        int dim) {
     int max_staging = search_width * max_degree0;
+    int dim4_aligned = ((dim + 3) / 4) * 4;
 
     size_t size = 0;
-    size += ef * sizeof(uint32_t);
-    size += ef * sizeof(float);
-    size += ef * sizeof(uint32_t);
-    size += max_staging * sizeof(uint32_t);
-    size += max_staging * sizeof(float);
-    size += search_width * sizeof(uint32_t);
-    size += 3 * sizeof(int);
+    // Query cache: float + int8 quantized
+    size += dim * sizeof(float);        // s_query_float
+    size += dim4_aligned * sizeof(int8_t); // s_query_int8
+    // Alignment padding (up to 3 bytes)
+    size = (size + 3) & ~size_t(3);
+    // Beam search state
+    size += ef * sizeof(uint32_t);       // result_ids
+    size += ef * sizeof(float);          // result_dists
+    size += ef * sizeof(uint32_t);       // is_expanded
+    size += max_staging * sizeof(uint32_t); // staging_ids
+    size += max_staging * sizeof(float);    // staging_dists
+    size += search_width * sizeof(uint32_t); // parent_ids
+    size += 3 * sizeof(int);             // meta
+    // Note: quantize_query_to_smem's __shared__ s_max_abs is statically
+    // allocated (not part of extern __shared__), so not counted here.
     return size;
 }
 

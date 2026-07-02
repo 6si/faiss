@@ -104,7 +104,11 @@ inline void gpu_hnsw_search(
                 params.thread_block_size > 0 ? params.thread_block_size : 128;
 
         {
-            int smem_overhead = sw * idx.max_degree0 * 8 + sw * 4 + 12;
+            // Account for query cache (float + int8) in smem budget
+            int dim4_aligned = ((dim + 3) / 4) * 4;
+            int query_smem = dim * 4 + dim4_aligned + 4 + 4; // float + int8 + align + s_max_abs
+            int smem_overhead = sw * idx.max_degree0 * 8 + sw * 4 + 12
+                    + query_smem;
             int max_ef = (49152 - smem_overhead) / 12;
             if (ef > max_ef) {
                 ef = max_ef;
@@ -112,7 +116,7 @@ inline void gpu_hnsw_search(
         }
 
         size_t smem_size = hnsw_kernel::calc_layer0_smem_size(
-                ef, sw, idx.max_degree0);
+                ef, sw, idx.max_degree0, dim);
         int N_int = static_cast<int>(idx.n_rows);
         size_t bitmap_bytes = hnsw_kernel::calc_visited_bitmap_size(
                 num_queries, N_int);
