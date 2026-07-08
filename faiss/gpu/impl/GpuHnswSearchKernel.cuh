@@ -75,66 +75,6 @@ __device__ __forceinline__ float thread_ip_distance(
 }
 
 // ============================================================================
-// Warp-cooperative distance computation
-// ============================================================================
-
-__device__ __forceinline__ int select_threads_per_dist(int dim) {
-    // Always use 1 thread per distance: 128 concurrent distances per block
-    // vs 32 with 4-thread cooperative. For int8 dim=384, each vector is only
-    // 384 bytes — fits in L1 cache. The 4x concurrency gain outweighs the
-    // cooperative memory coalescing benefit at this data size.
-    (void)dim;
-    return 1;
-}
-
-template <typename DataT>
-__device__ __forceinline__ float coop_l2_distance(
-        const float* __restrict__ query,
-        const DataT* __restrict__ vec,
-        int dim,
-        int lane_in_group,
-        int threads_per_dist,
-        uint32_t group_mask) {
-    int chunk = dim / threads_per_dist;
-    int start = lane_in_group * chunk;
-    int end = (lane_in_group == threads_per_dist - 1) ? dim : start + chunk;
-
-    float partial = 0.0f;
-    for (int d = start; d < end; d++) {
-        float diff = query[d] - load_elem(vec, d);
-        partial += diff * diff;
-    }
-
-    for (int offset = threads_per_dist / 2; offset > 0; offset >>= 1) {
-        partial += __shfl_down_sync(group_mask, partial, offset);
-    }
-    return partial;
-}
-
-template <typename DataT>
-__device__ __forceinline__ float coop_ip_distance(
-        const float* __restrict__ query,
-        const DataT* __restrict__ vec,
-        int dim,
-        int lane_in_group,
-        int threads_per_dist,
-        uint32_t group_mask) {
-    int chunk = dim / threads_per_dist;
-    int start = lane_in_group * chunk;
-    int end = (lane_in_group == threads_per_dist - 1) ? dim : start + chunk;
-
-    float partial = 0.0f;
-    for (int d = start; d < end; d++) {
-        partial += query[d] * load_elem(vec, d);
-    }
-
-    for (int offset = threads_per_dist / 2; offset > 0; offset >>= 1) {
-        partial += __shfl_down_sync(group_mask, partial, offset);
-    }
-    return -partial;
-}
-
-// ============================================================================
 // Phase 1: Upper-layer greedy search
 // ============================================================================
 
