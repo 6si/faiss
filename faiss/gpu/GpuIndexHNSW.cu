@@ -162,7 +162,6 @@ void GpuIndexHNSW::searchImpl_(
             sp.search_width = params->search_width;
             sp.max_iterations = params->max_iterations;
             sp.thread_block_size = params->thread_block_size;
-            sp.overflow_factor = params->overflow_factor;
             got_params = true;
         }
     }
@@ -174,8 +173,7 @@ void GpuIndexHNSW::searchImpl_(
 
     int nq = static_cast<int>(n);
     int dim = static_cast<int>(idx.dim);
-    int overflow_ef = sp.overflow_factor * sp.ef;
-    sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), overflow_ef);
+    sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows));
 
     // D2D: query vectors (GpuIndex::search passes device pointers)
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
@@ -242,8 +240,7 @@ void GpuIndexHNSW::searchHost(
 
     int nq = static_cast<int>(n);
     int dim = static_cast<int>(idx.dim);
-    int overflow_ef = sp.overflow_factor * sp.ef;
-    sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), overflow_ef);
+    sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows));
 
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             sc.d_queries,

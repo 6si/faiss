@@ -48,8 +48,7 @@ void GpuHnswSearchScratch::ensure(
         int nq,
         int k,
         int dim,
-        int N,
-        int overflow_ef) {
+        int N) {
     size_t need_q = static_cast<size_t>(nq) * dim * sizeof(float);
     if (need_q > queries_bytes) {
         if (d_queries)
@@ -88,33 +87,6 @@ void GpuHnswSearchScratch::ensure(
         SCRATCH_CUDA_CHECK(cudaMalloc(&d_visited_bitmaps, need_bm));
         bitmap_bytes = need_bm;
     }
-    if (overflow_ef > 0) {
-        size_t ovf_entries = static_cast<size_t>(nq) * overflow_ef;
-        size_t need_ovf =
-                ovf_entries *
-                        (sizeof(uint32_t) + sizeof(float) + sizeof(uint32_t)) +
-                static_cast<size_t>(nq) * sizeof(int);
-        if (need_ovf > overflow_bytes) {
-            if (d_overflow_ids)
-                cudaFree(d_overflow_ids);
-            if (d_overflow_dists)
-                cudaFree(d_overflow_dists);
-            if (d_overflow_expanded)
-                cudaFree(d_overflow_expanded);
-            if (d_overflow_count)
-                cudaFree(d_overflow_count);
-            SCRATCH_CUDA_CHECK(cudaMalloc(
-                    &d_overflow_ids, ovf_entries * sizeof(uint32_t)));
-            SCRATCH_CUDA_CHECK(cudaMalloc(
-                    &d_overflow_dists, ovf_entries * sizeof(float)));
-            SCRATCH_CUDA_CHECK(cudaMalloc(
-                    &d_overflow_expanded, ovf_entries * sizeof(uint32_t)));
-            SCRATCH_CUDA_CHECK(cudaMalloc(
-                    &d_overflow_count,
-                    static_cast<size_t>(nq) * sizeof(int)));
-            overflow_bytes = need_ovf;
-        }
-    }
 }
 
 GpuHnswSearchScratch::~GpuHnswSearchScratch() {
@@ -128,14 +100,6 @@ GpuHnswSearchScratch::~GpuHnswSearchScratch() {
         cudaFree(d_entry_points);
     if (d_visited_bitmaps)
         cudaFree(d_visited_bitmaps);
-    if (d_overflow_ids)
-        cudaFree(d_overflow_ids);
-    if (d_overflow_dists)
-        cudaFree(d_overflow_dists);
-    if (d_overflow_expanded)
-        cudaFree(d_overflow_expanded);
-    if (d_overflow_count)
-        cudaFree(d_overflow_count);
 }
 
 GpuHnswScratchSlot::~GpuHnswScratchSlot() {

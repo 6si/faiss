@@ -202,7 +202,7 @@ __global__ void upper_layer_search_kernel(
 }
 
 // ============================================================================
-// Phase 2: Layer-0 beam search kernel with Overflow Candidate Queue (OCQ)
+// Phase 2: Layer-0 parallel beam search kernel
 // ============================================================================
 
 __device__ __forceinline__ bool bitmap_visit(
@@ -212,40 +212,6 @@ __device__ __forceinline__ bool bitmap_visit(
     uint32_t bit = 1u << (node_id & 31);
     uint32_t old = atomicOr(&bitmap[word], bit);
     return (old & bit) == 0;
-}
-
-__device__ __forceinline__ void overflow_insert(
-        uint32_t* ovf_ids,
-        float* ovf_dists,
-        uint32_t* ovf_exp,
-        int& ovf_rc,
-        int overflow_ef,
-        uint32_t id,
-        float dist,
-        uint32_t expanded) {
-    if (ovf_rc >= overflow_ef && dist >= ovf_dists[ovf_rc - 1])
-        return;
-
-    int lo = 0, hi = ovf_rc;
-    while (lo < hi) {
-        int mid = (lo + hi) / 2;
-        if (ovf_dists[mid] < dist)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-
-    int insert_end = ovf_rc < overflow_ef ? ovf_rc : overflow_ef - 1;
-    for (int i = insert_end; i > lo; i--) {
-        ovf_ids[i] = ovf_ids[i - 1];
-        ovf_dists[i] = ovf_dists[i - 1];
-        ovf_exp[i] = ovf_exp[i - 1];
-    }
-    ovf_ids[lo] = id;
-    ovf_dists[lo] = dist;
-    ovf_exp[lo] = expanded;
-    if (ovf_rc < overflow_ef)
-        ovf_rc++;
 }
 
 template <typename DataT>
@@ -266,12 +232,7 @@ __global__ void layer0_beam_search_kernel(
         int ef,
         int search_width,
         int max_iterations,
-        bool use_inner_product,
-        int overflow_ef,
-        uint32_t* __restrict__ d_overflow_ids,
-        float* __restrict__ d_overflow_dists,
-        uint32_t* __restrict__ d_overflow_expanded,
-        int* __restrict__ d_overflow_count) {
+        bool use_inner_product) {
     int query_idx = blockIdx.x;
     if (query_idx >= num_queries)
         return;
@@ -295,17 +256,6 @@ __global__ void layer0_beam_search_kernel(
     uint32_t* visited_bmap =
             d_visited_bitmaps + static_cast<int64_t>(query_idx) * bitmap_words;
 
-    uint32_t* ovf_ids = overflow_ef > 0
-            ? d_overflow_ids + static_cast<int64_t>(query_idx) * overflow_ef
-            : nullptr;
-    float* ovf_dists = overflow_ef > 0
-            ? d_overflow_dists + static_cast<int64_t>(query_idx) * overflow_ef
-            : nullptr;
-    uint32_t* ovf_exp = overflow_ef > 0
-            ? d_overflow_expanded +
-                    static_cast<int64_t>(query_idx) * overflow_ef
-            : nullptr;
-
     for (int i = threadIdx.x; i < ef; i += blockDim.x) {
         result_ids[i] = UINT32_MAX;
         result_dists[i] = FLT_MAX;
@@ -315,8 +265,6 @@ __global__ void layer0_beam_search_kernel(
         meta[0] = 0;
         meta[1] = 0;
         meta[2] = 0;
-        if (overflow_ef > 0)
-            d_overflow_count[query_idx] = 0;
     }
     __syncthreads();
 
@@ -426,16 +374,6 @@ __global__ void layer0_beam_search_kernel(
                 }
             }
 
-            if (num_parents == 0 && overflow_ef > 0) {
-                int ovf_rc = d_overflow_count[query_idx];
-                for (int i = 0; i < ovf_rc && num_parents < search_width;
-                     i++) {
-                    if (!ovf_exp[i]) {
-                        parent_ids[num_parents++] = ovf_ids[i];
-                        ovf_exp[i] = 1;
-                    }
-                }
-            }
             meta[2] = num_parents;
         }
         __syncthreads();

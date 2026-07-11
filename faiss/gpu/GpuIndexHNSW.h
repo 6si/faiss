@@ -56,17 +56,14 @@ struct SearchParametersGpuHNSW : SearchParameters {
 
     /// Thread block size (0 = auto, default 128).
     int thread_block_size = 0;
-
-    /// Overflow queue factor: overflow_ef = overflow_factor * ef.
-    int overflow_factor = 2;
 };
 
 /// GPU implementation of HNSW search.
 ///
 /// This index type does NOT build an HNSW graph on GPU — it takes a
 /// CPU-built faiss::IndexHNSW (Flat or SQ storage), converts the graph
-/// to a GPU-friendly dense format, and runs the search on GPU using an
-/// Overflow Candidate Queue (OCQ) beam search kernel.
+/// to a GPU-friendly dense format, and runs the search on GPU using a
+/// parallel beam search kernel.
 ///
 /// Supports L2, inner product, and cosine metrics.
 /// Supports float32 and int8 (QT_8bit_direct_signed) data.

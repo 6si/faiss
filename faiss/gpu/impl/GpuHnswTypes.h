@@ -39,9 +39,6 @@ struct GpuHnswSearchParams {
     int search_width = 4;
     int max_iterations = 0;
     int thread_block_size = 0;
-    // Keep in sync with SearchParametersGpuHNSW::overflow_factor: a zero here
-    // would disable the overflow candidate queue and silently drop recall.
-    int overflow_factor = 2;
 };
 
 struct GpuHnswDeviceUpperLayer {
@@ -58,19 +55,13 @@ struct GpuHnswSearchScratch {
     uint32_t* d_entry_points = nullptr;
     uint32_t* d_visited_bitmaps = nullptr;
 
-    uint32_t* d_overflow_ids = nullptr;
-    float* d_overflow_dists = nullptr;
-    uint32_t* d_overflow_expanded = nullptr;
-    int* d_overflow_count = nullptr;
-
     size_t queries_bytes = 0;
     size_t neighbors_bytes = 0;
     size_t distances_bytes = 0;
     int entry_cap = 0;
     size_t bitmap_bytes = 0;
-    size_t overflow_bytes = 0;
 
-    void ensure(int nq, int k, int dim, int N, int overflow_ef);
+    void ensure(int nq, int k, int dim, int N);
 
     ~GpuHnswSearchScratch();
 

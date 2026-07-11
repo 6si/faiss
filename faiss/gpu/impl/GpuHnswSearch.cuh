@@ -58,7 +58,6 @@ inline void gpu_hnsw_search(
 
     int ef = params.ef;
     int sw = params.search_width;
-    int overflow_ef = params.overflow_factor * ef;
     int max_iter = params.max_iterations > 0
             ? params.max_iterations
             : 2 * ef / sw + 10;
@@ -150,13 +149,6 @@ inline void gpu_hnsw_search(
 
         GPU_HNSW_CUDA_CHECK(
                 cudaMemsetAsync(sc.d_visited_bitmaps, 0, bitmap_bytes, stream));
-        if (overflow_ef > 0) {
-            GPU_HNSW_CUDA_CHECK(cudaMemsetAsync(
-                    sc.d_overflow_count,
-                    0,
-                    static_cast<size_t>(num_queries) * sizeof(int),
-                    stream));
-        }
 
         hnsw_kernel::layer0_beam_search_kernel<DataT>
                 <<<num_queries, block_size, smem_size, stream>>>(
@@ -176,12 +168,7 @@ inline void gpu_hnsw_search(
                         ef,
                         sw,
                         max_iter,
-                        idx.use_ip,
-                        overflow_ef,
-                        sc.d_overflow_ids,
-                        sc.d_overflow_dists,
-                        sc.d_overflow_expanded,
-                        sc.d_overflow_count);
+                        idx.use_ip);
         GPU_HNSW_CUDA_CHECK(cudaGetLastError());
     };
 
