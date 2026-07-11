@@ -222,7 +222,48 @@ inline void upload_fp32_dataset(
             h_vectors.data(),
             dataset_bytes,
             cudaMemcpyHostToDevice));
-    idx.dataset_int8 = false;
+    idx.dataset_type = GpuHnswDatasetType::FP32;
+}
+
+// Upload fp16 (QT_fp16) or bf16 (QT_bf16) ScalarQuantizer codes to the GPU in
+// their native 2-byte layout. faiss stores these codes row-major as raw IEEE
+// half / bfloat16, which are bit-compatible with CUDA half / __nv_bfloat16, so
+// the bytes are copied verbatim (no up-conversion to fp32). For cosine, inverse
+// L2 norms are computed from the fp32-decoded values and applied at search time
+// — mirroring the int8 path, since the stored codes are not normalized.
+inline void upload_halfwidth_dataset(
+        GpuHnswDeviceIndex& idx,
+        const uint8_t* codes,
+        const float* decoded_for_norms,
+        int64_t n_rows,
+        bool is_cosine,
+        GpuHnswDatasetType dtype) {
+    int64_t dim = idx.dim;
+    size_t dataset_bytes = static_cast<size_t>(n_rows) * dim * 2;
+    GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(&idx.d_dataset, dataset_bytes));
+    GPU_HNSW_BUILD_CUDA_CHECK(cudaMemcpy(
+            idx.d_dataset, codes, dataset_bytes, cudaMemcpyHostToDevice));
+    idx.dataset_type = dtype;
+
+    if (is_cosine && decoded_for_norms) {
+        std::vector<float> h_inv_norms(n_rows);
+        for (int64_t i = 0; i < n_rows; i++) {
+            const float* row = decoded_for_norms + i * dim;
+            float sq_norm = 0.0f;
+            for (int64_t d = 0; d < dim; d++) {
+                sq_norm += row[d] * row[d];
+            }
+            h_inv_norms[i] =
+                    (sq_norm > 0.0f) ? (1.0f / std::sqrt(sq_norm)) : 0.0f;
+        }
+        size_t norms_bytes = static_cast<size_t>(n_rows) * sizeof(float);
+        GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(&idx.d_inv_norms, norms_bytes));
+        GPU_HNSW_BUILD_CUDA_CHECK(cudaMemcpy(
+                idx.d_inv_norms,
+                h_inv_norms.data(),
+                norms_bytes,
+                cudaMemcpyHostToDevice));
+    }
 }
 
 inline void upload_int8_dataset(
@@ -245,7 +286,7 @@ inline void upload_int8_dataset(
             signed_codes.data(),
             dataset_bytes,
             cudaMemcpyHostToDevice));
-    idx.dataset_int8 = true;
+    idx.dataset_type = GpuHnswDatasetType::INT8;
 
     if (is_cosine) {
         std::vector<float> h_inv_norms(n_rows);
@@ -293,11 +334,32 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
     idx->device = device;
     idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, device);
 
-    bool is_direct_signed = (sq_storage->sq.qtype ==
-                             faiss::ScalarQuantizer::QT_8bit_direct_signed);
+    auto qtype = sq_storage->sq.qtype;
 
-    if (is_direct_signed) {
+    if (qtype == faiss::ScalarQuantizer::QT_8bit_direct_signed) {
         upload_int8_dataset(*idx, sq_storage->codes.data(), n_rows, is_cosine);
+    } else if (
+            qtype == faiss::ScalarQuantizer::QT_fp16 ||
+            qtype == faiss::ScalarQuantizer::QT_bf16) {
+        // Keep fp16/bf16 in their native 2-byte layout on the GPU. Decode to
+        // fp32 only when cosine needs the row norms.
+        GpuHnswDatasetType dtype =
+                (qtype == faiss::ScalarQuantizer::QT_fp16)
+                        ? GpuHnswDatasetType::FP16
+                        : GpuHnswDatasetType::BF16;
+        std::vector<float> decoded;
+        if (is_cosine) {
+            decoded.resize(static_cast<size_t>(n_rows) * dim);
+            sq_storage->sa_decode(
+                    n_rows, sq_storage->codes.data(), decoded.data());
+        }
+        upload_halfwidth_dataset(
+                *idx,
+                sq_storage->codes.data(),
+                is_cosine ? decoded.data() : nullptr,
+                n_rows,
+                is_cosine,
+                dtype);
     } else {
         std::vector<float> h_vectors(n_rows * dim);
         sq_storage->sa_decode(

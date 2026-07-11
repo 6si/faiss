@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -42,6 +43,9 @@ __device__ __forceinline__ float load_elem(const float* ptr, int idx) {
 }
 __device__ __forceinline__ float load_elem(const half* ptr, int idx) {
     return __half2float(__ldg(&ptr[idx]));
+}
+__device__ __forceinline__ float load_elem(const __nv_bfloat16* ptr, int idx) {
+    return __bfloat162float(__ldg(&ptr[idx]));
 }
 __device__ __forceinline__ float load_elem(const int8_t* ptr, int idx) {
     return static_cast<float>(__ldg(&ptr[idx]));

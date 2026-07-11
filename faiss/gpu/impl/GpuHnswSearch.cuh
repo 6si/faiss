@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -184,12 +186,25 @@ inline void gpu_hnsw_search(
         GPU_HNSW_CUDA_CHECK(cudaGetLastError());
     };
 
-    if (idx.dataset_int8) {
-        launch_kernels(
-                static_cast<const int8_t*>(idx.d_dataset), idx.d_inv_norms);
-    } else {
-        launch_kernels(
-                static_cast<const float*>(idx.d_dataset), idx.d_inv_norms);
+    switch (idx.dataset_type) {
+        case GpuHnswDatasetType::INT8:
+            launch_kernels(
+                    static_cast<const int8_t*>(idx.d_dataset), idx.d_inv_norms);
+            break;
+        case GpuHnswDatasetType::FP16:
+            launch_kernels(
+                    static_cast<const half*>(idx.d_dataset), idx.d_inv_norms);
+            break;
+        case GpuHnswDatasetType::BF16:
+            launch_kernels(
+                    static_cast<const __nv_bfloat16*>(idx.d_dataset),
+                    idx.d_inv_norms);
+            break;
+        case GpuHnswDatasetType::FP32:
+        default:
+            launch_kernels(
+                    static_cast<const float*>(idx.d_dataset), idx.d_inv_norms);
+            break;
     }
 }
 

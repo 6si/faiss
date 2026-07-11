@@ -34,6 +34,17 @@
 namespace faiss {
 namespace gpu {
 
+// Element type of the device-resident dataset. The graph walk kernel is
+// templated on this; each value selects a load_elem specialization so the
+// vectors stay in their native precision on the GPU (no up-conversion to
+// fp32 at upload time).
+enum class GpuHnswDatasetType {
+    FP32 = 0,
+    INT8 = 1,
+    FP16 = 2,
+    BF16 = 3,
+};
+
 struct GpuHnswSearchParams {
     int ef = 200;
     int search_width = 4;
@@ -134,7 +145,7 @@ class ScratchPoolGuard {
 
 struct GpuHnswDeviceIndex {
     void* d_dataset = nullptr;
-    bool dataset_int8 = false;
+    GpuHnswDatasetType dataset_type = GpuHnswDatasetType::FP32;
     float* d_inv_norms = nullptr;
     uint32_t* d_layer0_graph = nullptr;
     std::vector<GpuHnswDeviceUpperLayer> upper_layers;
