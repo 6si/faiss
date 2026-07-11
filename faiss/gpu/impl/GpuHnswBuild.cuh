@@ -274,7 +274,8 @@ inline void upload_int8_dataset(
 inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
         const faiss::cppcontrib::knowhere::IndexHNSW& hnsw_index,
         bool use_ip,
-        bool is_cosine = false) {
+        bool is_cosine = false,
+        int device = 0) {
     const auto* sq_storage =
             dynamic_cast<const faiss::IndexScalarQuantizer*>(
                     hnsw_index.storage);
@@ -289,7 +290,7 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
     idx->n_rows = n_rows;
     idx->dim = dim;
     idx->use_ip = use_ip;
-    idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, 0);
+    idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, device);
 
     bool is_direct_signed = (sq_storage->sq.qtype ==
                              faiss::ScalarQuantizer::QT_8bit_direct_signed);
@@ -311,7 +312,8 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
 inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_flat(
         const faiss::cppcontrib::knowhere::IndexHNSW& hnsw_index,
         bool use_ip,
-        bool is_cosine = false) {
+        bool is_cosine = false,
+        int device = 0) {
     const auto* flat_storage =
             dynamic_cast<const faiss::IndexFlat*>(hnsw_index.storage);
     if (!flat_storage)
@@ -330,7 +332,7 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_flat(
     idx->n_rows = n_rows;
     idx->dim = dim;
     idx->use_ip = use_ip;
-    idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, 0);
+    idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, device);
 
     upload_fp32_dataset(*idx, h_vectors, n_rows, is_cosine);
     upload_graph_to_gpu(*idx, hnsw_index.hnsw, n_rows);

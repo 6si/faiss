@@ -31,7 +31,11 @@
 
 namespace faiss {
 
+namespace cppcontrib {
+namespace knowhere {
 struct IndexHNSW;
+} // namespace knowhere
+} // namespace cppcontrib
 
 namespace gpu {
 
@@ -80,12 +84,24 @@ struct GpuIndexHNSW : public GpuIndex {
     /// The CPU index must have been built and trained already.
     /// Supports IndexHNSWFlat (float32) and IndexHNSWSQ
     /// (QT_8bit_direct_signed for INT8, or dequantized for other SQ types).
-    void copyFrom(const faiss::IndexHNSW* index);
+    void copyFrom(const faiss::cppcontrib::knowhere::IndexHNSW* index);
+
+    /// Like copyFrom(), but with the metric interpretation supplied by the
+    /// caller instead of being detected from the index type.
+    /// \param use_ip     treat the metric as inner product
+    /// \param is_cosine  the storage carries cosine (inverse L2) norms
+    void copyFromWithMetric(
+            const faiss::cppcontrib::knowhere::IndexHNSW* index,
+            bool use_ip,
+            bool is_cosine);
 
     void reset() override;
 
     /// Set search parameters directly, bypassing SearchParameters.
-    /// Thread-safe: uses atomic/mutex internally.
+    /// Mutex-guarded. The params are sticky: once set they apply to every
+    /// subsequent search() until overwritten by another setSearchParams()
+    /// call. Prefer passing SearchParametersGpuHNSW per-search (or using
+    /// searchHost) when different concurrent searches need different params.
     void setSearchParams(const GpuHnswSearchParams& params) const;
 
     /// Search with host pointers directly, bypassing GpuIndex::search.

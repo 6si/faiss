@@ -69,9 +69,11 @@ void GpuIndexHNSW::copyFrom(
             is_cosine || (index->metric_type == faiss::METRIC_INNER_PRODUCT);
 
     if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
-        deviceIndex_ = from_faiss_hnsw_sq(*index, use_ip, is_cosine);
+        deviceIndex_ =
+                from_faiss_hnsw_sq(*index, use_ip, is_cosine, config_.device);
     } else {
-        deviceIndex_ = from_faiss_hnsw_flat(*index, use_ip, is_cosine);
+        deviceIndex_ =
+                from_faiss_hnsw_flat(*index, use_ip, is_cosine, config_.device);
     }
 
     this->is_trained = true;
@@ -91,9 +93,11 @@ void GpuIndexHNSW::copyFromWithMetric(
     this->ntotal = index->ntotal;
 
     if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
-        deviceIndex_ = from_faiss_hnsw_sq(*index, use_ip, is_cosine);
+        deviceIndex_ =
+                from_faiss_hnsw_sq(*index, use_ip, is_cosine, config_.device);
     } else {
-        deviceIndex_ = from_faiss_hnsw_flat(*index, use_ip, is_cosine);
+        deviceIndex_ =
+                from_faiss_hnsw_flat(*index, use_ip, is_cosine, config_.device);
     }
 
     this->is_trained = true;
@@ -139,11 +143,12 @@ void GpuIndexHNSW::searchImpl_(
     bool got_params = false;
 
     // Prefer direct params set via setSearchParams() — avoids dynamic_cast.
+    // These are sticky: they stay in effect for every subsequent search until
+    // overwritten, so a later search never silently falls back to defaults.
     {
         std::lock_guard<std::mutex> lock(searchParamsMutex_);
         if (hasDirectSearchParams_) {
             sp = directSearchParams_;
-            hasDirectSearchParams_ = false;
             got_params = true;
         }
     }

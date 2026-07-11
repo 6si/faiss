@@ -98,14 +98,35 @@ inline void gpu_hnsw_search(
                     num_queries * sizeof(uint32_t),
                     cudaMemcpyHostToDevice,
                     stream));
+            // h_eps is stack-local; synchronize before it is destroyed so the
+            // copy never reads freed memory (safe even if the source buffer is
+            // ever switched to pinned host memory).
+            GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         int block_size =
                 params.thread_block_size > 0 ? params.thread_block_size : 128;
 
+        // Per-block dynamic shared-memory budget for this device. The default
+        // limit is 48 KiB, but Volta+ GPUs can opt into more via
+        // cudaFuncSetAttribute; query the real limit instead of assuming 48 KiB.
+        int smem_max = 49152;
+        {
+            int device = 0;
+            int optin = 0;
+            if (cudaGetDevice(&device) == cudaSuccess &&
+                cudaDeviceGetAttribute(
+                        &optin,
+                        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                        device) == cudaSuccess &&
+                optin > smem_max) {
+                smem_max = optin;
+            }
+        }
+
         {
             int smem_overhead = sw * idx.max_degree0 * 8 + sw * 4 + 12;
-            int max_ef = (49152 - smem_overhead) / 12;
+            int max_ef = (smem_max - smem_overhead) / 12;
             if (ef > max_ef) {
                 ef = max_ef;
             }
@@ -113,6 +134,16 @@ inline void gpu_hnsw_search(
 
         size_t smem_size = hnsw_kernel::calc_layer0_smem_size(
                 ef, sw, idx.max_degree0);
+
+        // Opt into >48 KiB dynamic shared memory when the device supports it;
+        // without this the kernel launch would fail for large ef.
+        if (smem_size > 49152) {
+            GPU_HNSW_CUDA_CHECK(cudaFuncSetAttribute(
+                    hnsw_kernel::layer0_beam_search_kernel<DataT>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(smem_size)));
+        }
+
         int N_int = static_cast<int>(idx.n_rows);
         size_t bitmap_bytes = hnsw_kernel::calc_visited_bitmap_size(
                 num_queries, N_int);
