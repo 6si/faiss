@@ -61,6 +61,10 @@ struct GpuHnswSearchScratch {
     int entry_cap = 0;
     size_t bitmap_bytes = 0;
 
+    // Device this scratch's allocations live on; used to set the CUDA device
+    // context before freeing in the destructor (multi-GPU correctness).
+    int device = 0;
+
     void ensure(int nq, int k, int dim, int N);
 
     ~GpuHnswSearchScratch();
@@ -145,6 +149,10 @@ struct GpuHnswDeviceIndex {
 
     void* d_upper_layer_ptrs = nullptr;
     int num_upper_layers_built = 0;
+
+    // Device this index's allocations live on; used to set the CUDA device
+    // context before freeing in the destructor (multi-GPU correctness).
+    int device = 0;
 
     mutable std::unique_ptr<GpuHnswScratchPool> scratch_pool;
 

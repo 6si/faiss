@@ -126,6 +126,18 @@ inline void gpu_hnsw_search(
         {
             int smem_overhead = sw * idx.max_degree0 * 8 + sw * 4 + 12;
             int max_ef = (smem_max - smem_overhead) / 12;
+            // A search_width so large that even ef=1 does not fit in shared
+            // memory leaves no valid beam. Fail clearly rather than clamping ef
+            // to a negative/zero value (which would launch with a bad geometry
+            // or read out of bounds).
+            if (max_ef < 1) {
+                throw std::runtime_error(
+                        std::string("gpu_hnsw: search_width=") +
+                        std::to_string(sw) +
+                        " too large for device shared memory (" +
+                        std::to_string(smem_max) +
+                        " bytes); reduce search_width");
+            }
             if (ef > max_ef) {
                 ef = max_ef;
             }

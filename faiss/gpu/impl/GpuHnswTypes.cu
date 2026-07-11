@@ -90,6 +90,9 @@ void GpuHnswSearchScratch::ensure(
 }
 
 GpuHnswSearchScratch::~GpuHnswSearchScratch() {
+    // Set the owning device before freeing so cudaFree runs in the correct
+    // context on multi-GPU systems.
+    cudaSetDevice(device);
     if (d_queries)
         cudaFree(d_queries);
     if (d_neighbors)
@@ -117,6 +120,7 @@ void GpuHnswScratchPool::init_once() {
     available_.reserve(pool_size_);
     for (int i = 0; i < pool_size_; i++) {
         auto slot = std::make_unique<GpuHnswScratchSlot>();
+        slot->scratch.device = device_;
         SCRATCH_CUDA_CHECK(cudaSetDevice(device_));
         SCRATCH_CUDA_CHECK(
                 cudaStreamCreateWithFlags(&slot->stream, cudaStreamNonBlocking));
@@ -144,6 +148,9 @@ void GpuHnswScratchPool::release(GpuHnswScratchSlot* slot) {
 }
 
 GpuHnswDeviceIndex::~GpuHnswDeviceIndex() {
+    // Set the owning device before freeing so cudaFree runs in the correct
+    // context on multi-GPU systems.
+    cudaSetDevice(device);
     if (d_dataset)
         cudaFree(d_dataset);
     if (d_inv_norms)

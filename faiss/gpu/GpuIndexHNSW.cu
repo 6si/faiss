@@ -175,6 +175,19 @@ void GpuIndexHNSW::searchImpl_(
     int dim = static_cast<int>(idx.dim);
     sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows));
 
+    // The parent GpuIndex::search copied host queries into `x` (and will later
+    // copy outputs back) on the resources' default stream. Our scratch-pool
+    // slot has its own private stream, so make it wait for that H2D/D2D copy to
+    // complete before we read `x` — otherwise the search can race ahead and
+    // operate on partially-written query vectors.
+    cudaStream_t defaultStream = resources_->getDefaultStream(config_.device);
+    cudaEvent_t inputReady;
+    GPU_HNSW_CUDA_CHECK(
+            cudaEventCreateWithFlags(&inputReady, cudaEventDisableTiming));
+    GPU_HNSW_CUDA_CHECK(cudaEventRecord(inputReady, defaultStream));
+    GPU_HNSW_CUDA_CHECK(cudaStreamWaitEvent(stream, inputReady, 0));
+    GPU_HNSW_CUDA_CHECK(cudaEventDestroy(inputReady));
+
     // D2D: query vectors (GpuIndex::search passes device pointers)
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             sc.d_queries,
