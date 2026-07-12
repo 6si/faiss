@@ -127,7 +127,6 @@ inline void extract_hnsw_layers(
         ul.num_nodes = static_cast<uint32_t>(node_ids.size());
 
         std::vector<uint32_t> h_neighbors(ul.num_nodes * maxM, UINT32_MAX);
-        std::vector<uint32_t> h_node_ids = node_ids;
 
         for (uint32_t idx = 0; idx < ul.num_nodes; idx++) {
             int64_t i = node_ids[idx];
@@ -145,7 +144,7 @@ inline void extract_hnsw_layers(
                 cudaMalloc(&ul.d_node_ids, ul.num_nodes * sizeof(uint32_t)));
         GPU_HNSW_BUILD_CUDA_CHECK(cudaMemcpy(
                 ul.d_node_ids,
-                h_node_ids.data(),
+                node_ids.data(),
                 ul.num_nodes * sizeof(uint32_t),
                 cudaMemcpyHostToDevice));
 
