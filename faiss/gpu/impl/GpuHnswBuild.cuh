@@ -46,15 +46,23 @@
 #include <faiss/gpu/impl/GpuHnswSearchKernel.cuh>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
 
-#define GPU_HNSW_BUILD_CUDA_CHECK(expr)                               \
-    do {                                                              \
-        cudaError_t _e = (expr);                                      \
-        if (_e != cudaSuccess) {                                      \
-            throw std::runtime_error(                                 \
-                    std::string("CUDA error: ") +                     \
-                    cudaGetErrorString(_e) + " at " + __FILE__ + ":" + \
-                    std::to_string(__LINE__));                         \
-        }                                                             \
+// GpuHnswUploadFaultInjection (used below) lives in GpuHnswTypes.h so it is
+// reachable from host-compiled unit tests without pulling in device kernels.
+#define GPU_HNSW_BUILD_CUDA_CHECK(expr)                                  \
+    do {                                                                 \
+        if (faiss::gpu::GpuHnswUploadFaultInjection::should_fail()) {     \
+            throw std::runtime_error(                                    \
+                    std::string("CUDA error (injected): simulated ") +   \
+                    "upload failure at " + __FILE__ + ":" +              \
+                    std::to_string(__LINE__));                           \
+        }                                                                \
+        cudaError_t _e = (expr);                                         \
+        if (_e != cudaSuccess) {                                         \
+            throw std::runtime_error(                                    \
+                    std::string("CUDA error: ") +                        \
+                    cudaGetErrorString(_e) + " at " + __FILE__ + ":" +   \
+                    std::to_string(__LINE__));                           \
+        }                                                                \
     } while (0)
 
 namespace faiss {

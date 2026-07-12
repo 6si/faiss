@@ -25,6 +25,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -33,6 +34,36 @@
 
 namespace faiss {
 namespace gpu {
+
+// Test-only fault injection for the device-upload path (consulted by
+// GPU_HNSW_BUILD_CUDA_CHECK in GpuHnswBuild.cuh). Production code never arms it
+// (the countdown stays 0), so the check is a single relaxed atomic load per
+// wrapped CUDA call with no runtime effect. Unit tests call arm(n) so the n-th
+// subsequent wrapped CUDA call reports a simulated failure, exercising
+// Deserialize()'s upload error / partial-allocation cleanup / retry path
+// without a real OOM. Defined here (host-safe header) rather than in the .cuh so
+// host-compiled tests can arm it without pulling in device kernels. The static
+// lives in an inline function, so all translation units share one instance.
+struct GpuHnswUploadFaultInjection {
+    static std::atomic<int>& countdown() {
+        static std::atomic<int> c{0};
+        return c;
+    }
+    // Arm so the n-th following wrapped CUDA call fails (n >= 1). 0 disarms.
+    static void arm(int n) {
+        countdown().store(n, std::memory_order_relaxed);
+    }
+    static void disarm() {
+        countdown().store(0, std::memory_order_relaxed);
+    }
+    // Returns true exactly once, on the n-th call after arm(n); self-disarms.
+    static bool should_fail() {
+        int cur = countdown().load(std::memory_order_relaxed);
+        if (cur <= 0)
+            return false;
+        return countdown().fetch_sub(1, std::memory_order_relaxed) == 1;
+    }
+};
 
 // Element type of the device-resident dataset. The graph walk kernel is
 // templated on this; each value selects a load_elem specialization so the
