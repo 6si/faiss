@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexScalarQuantizer.h>
+#include <faiss/cppcontrib/knowhere/IndexCosine.h>
 #include <faiss/cppcontrib/knowhere/IndexHNSW.h>
 #include <faiss/cppcontrib/knowhere/impl/HNSW.h>
 
@@ -215,13 +216,36 @@ inline void upload_graph_to_gpu(
 
 }
 
+// Upload precomputed per-row inverse L2 norms to the device. These must be the
+// norms of the *original* input vectors as recorded by the CPU cosine index
+// (HasInverseL2Norms::get_inverse_l2_norms()), NOT norms recomputed from
+// lossily-decoded codes — otherwise cosine scores and graph traversal diverge
+// from the CPU index for lossy SQ (SQ8 / fp16 / bf16). The search kernel
+// computes score = IP(query, decoded_db) * inv_norm[row], mirroring the CPU
+// WithCosineNormDistanceComputer.
+inline void upload_inv_norms(
+        GpuHnswDeviceIndex& idx,
+        const float* inv_norms,
+        int64_t n_rows) {
+    size_t norms_bytes = static_cast<size_t>(n_rows) * sizeof(float);
+    GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(&idx.d_inv_norms, norms_bytes));
+    GPU_HNSW_BUILD_CUDA_CHECK(cudaMemcpy(
+            idx.d_inv_norms, inv_norms, norms_bytes, cudaMemcpyHostToDevice));
+}
+
 inline void upload_fp32_dataset(
         GpuHnswDeviceIndex& idx,
         std::vector<float>& h_vectors,
         int64_t n_rows,
-        bool is_cosine) {
+        bool is_cosine,
+        const float* stored_inv_norms = nullptr) {
     int64_t dim = idx.dim;
-    if (is_cosine)
+    // Flat cosine (stored_inv_norms == nullptr): the stored vectors are the
+    // exact originals, so normalizing them in place yields cosine via plain
+    // inner product. Lossy-SQ cosine decoded to fp32 (stored_inv_norms != null):
+    // keep the decoded vectors un-normalized and apply the CPU index's original
+    // inverse norms at search time, matching CPU semantics for lossy codes.
+    if (is_cosine && stored_inv_norms == nullptr)
         normalize_vectors(h_vectors, n_rows, dim);
 
     size_t dataset_bytes = static_cast<size_t>(n_rows) * dim * sizeof(float);
@@ -232,21 +256,24 @@ inline void upload_fp32_dataset(
             dataset_bytes,
             cudaMemcpyHostToDevice));
     idx.dataset_type = GpuHnswDatasetType::FP32;
+
+    if (is_cosine && stored_inv_norms != nullptr)
+        upload_inv_norms(idx, stored_inv_norms, n_rows);
 }
 
 // Upload fp16 (QT_fp16) or bf16 (QT_bf16) ScalarQuantizer codes to the GPU in
 // their native 2-byte layout. faiss stores these codes row-major as raw IEEE
 // half / bfloat16, which are bit-compatible with CUDA half / __nv_bfloat16, so
-// the bytes are copied verbatim (no up-conversion to fp32). For cosine, inverse
-// L2 norms are computed from the fp32-decoded values and applied at search time
-// — mirroring the int8 path, since the stored codes are not normalized.
+// the bytes are copied verbatim (no up-conversion to fp32). For cosine, the CPU
+// index's original inverse L2 norms are applied at search time — mirroring the
+// int8 path, since the stored codes are not normalized.
 inline void upload_halfwidth_dataset(
         GpuHnswDeviceIndex& idx,
         const uint8_t* codes,
-        const float* decoded_for_norms,
         int64_t n_rows,
         bool is_cosine,
-        GpuHnswDatasetType dtype) {
+        GpuHnswDatasetType dtype,
+        const float* stored_inv_norms) {
     int64_t dim = idx.dim;
     size_t dataset_bytes = static_cast<size_t>(n_rows) * dim * 2;
     GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(&idx.d_dataset, dataset_bytes));
@@ -254,32 +281,19 @@ inline void upload_halfwidth_dataset(
             idx.d_dataset, codes, dataset_bytes, cudaMemcpyHostToDevice));
     idx.dataset_type = dtype;
 
-    if (is_cosine && decoded_for_norms) {
-        std::vector<float> h_inv_norms(n_rows);
-        for (int64_t i = 0; i < n_rows; i++) {
-            const float* row = decoded_for_norms + i * dim;
-            float sq_norm = 0.0f;
-            for (int64_t d = 0; d < dim; d++) {
-                sq_norm += row[d] * row[d];
-            }
-            h_inv_norms[i] =
-                    (sq_norm > 0.0f) ? (1.0f / std::sqrt(sq_norm)) : 0.0f;
-        }
-        size_t norms_bytes = static_cast<size_t>(n_rows) * sizeof(float);
-        GPU_HNSW_BUILD_CUDA_CHECK(cudaMalloc(&idx.d_inv_norms, norms_bytes));
-        GPU_HNSW_BUILD_CUDA_CHECK(cudaMemcpy(
-                idx.d_inv_norms,
-                h_inv_norms.data(),
-                norms_bytes,
-                cudaMemcpyHostToDevice));
-    }
+    // The stored fp16/bf16 codes are not normalized, so cosine needs the CPU
+    // index's original inverse norms (not norms recomputed from the lossy
+    // decoded values). Mirrors the int8 path.
+    if (is_cosine)
+        upload_inv_norms(idx, stored_inv_norms, n_rows);
 }
 
 inline void upload_int8_dataset(
         GpuHnswDeviceIndex& idx,
         const uint8_t* codes,
         int64_t n_rows,
-        bool is_cosine) {
+        bool is_cosine,
+        const float* stored_inv_norms) {
     int64_t dim = idx.dim;
     size_t dataset_bytes = static_cast<size_t>(n_rows) * dim;
 
@@ -297,27 +311,12 @@ inline void upload_int8_dataset(
             cudaMemcpyHostToDevice));
     idx.dataset_type = GpuHnswDatasetType::INT8;
 
-    if (is_cosine) {
-        std::vector<float> h_inv_norms(n_rows);
-        for (int64_t i = 0; i < n_rows; i++) {
-            const int8_t* row = signed_codes.data() + i * dim;
-            float sq_norm = 0.0f;
-            for (int64_t d = 0; d < dim; d++) {
-                float v = static_cast<float>(row[d]);
-                sq_norm += v * v;
-            }
-            h_inv_norms[i] =
-                    (sq_norm > 0.0f) ? (1.0f / std::sqrt(sq_norm)) : 0.0f;
-        }
-        size_t norms_bytes = static_cast<size_t>(n_rows) * sizeof(float);
-        GPU_HNSW_BUILD_CUDA_CHECK(
-                cudaMalloc(&idx.d_inv_norms, norms_bytes));
-        GPU_HNSW_BUILD_CUDA_CHECK(cudaMemcpy(
-                idx.d_inv_norms,
-                h_inv_norms.data(),
-                norms_bytes,
-                cudaMemcpyHostToDevice));
-    }
+    // Apply the CPU index's original inverse norms for cosine. For
+    // QT_8bit_direct_signed the codes are the original data (lossless), so these
+    // match a recompute; using the stored norms keeps all cosine paths uniform
+    // and bit-exact with the CPU index.
+    if (is_cosine)
+        upload_inv_norms(idx, stored_inv_norms, n_rows);
 }
 
 /// Build from Knowhere's HNSW index with SQ storage.
@@ -345,35 +344,51 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
 
     auto qtype = sq_storage->sq.qtype;
 
+    // For cosine, use the CPU index's inverse L2 norms computed from the
+    // *original* input vectors (HasInverseL2Norms::get_inverse_l2_norms()).
+    // Recomputing norms from lossily-decoded/quantized codes would diverge from
+    // the CPU index's scores and graph traversal for lossy SQ.
+    const float* stored_inv_norms = nullptr;
+    if (is_cosine) {
+        // The cosine norms live on the SQ storage (IndexScalarQuantizerCosine),
+        // which implements HasInverseL2Norms — not on the outer IndexHNSW.
+        const auto* cos = dynamic_cast<
+                const faiss::cppcontrib::knowhere::HasInverseL2Norms*>(
+                sq_storage);
+        if (!cos || !cos->get_inverse_l2_norms())
+            throw std::runtime_error(
+                    "gpu_hnsw: cosine SQ index missing inverse L2 norms");
+        stored_inv_norms = cos->get_inverse_l2_norms();
+    }
+
     if (qtype == faiss::ScalarQuantizer::QT_8bit_direct_signed) {
-        upload_int8_dataset(*idx, sq_storage->codes.data(), n_rows, is_cosine);
+        upload_int8_dataset(
+                *idx, sq_storage->codes.data(), n_rows, is_cosine,
+                stored_inv_norms);
     } else if (
             qtype == faiss::ScalarQuantizer::QT_fp16 ||
             qtype == faiss::ScalarQuantizer::QT_bf16) {
-        // Keep fp16/bf16 in their native 2-byte layout on the GPU. Decode to
-        // fp32 only when cosine needs the row norms.
+        // Keep fp16/bf16 in their native 2-byte layout on the GPU.
         GpuHnswDatasetType dtype =
                 (qtype == faiss::ScalarQuantizer::QT_fp16)
                         ? GpuHnswDatasetType::FP16
                         : GpuHnswDatasetType::BF16;
-        std::vector<float> decoded;
-        if (is_cosine) {
-            decoded.resize(static_cast<size_t>(n_rows) * dim);
-            sq_storage->sa_decode(
-                    n_rows, sq_storage->codes.data(), decoded.data());
-        }
         upload_halfwidth_dataset(
                 *idx,
                 sq_storage->codes.data(),
-                is_cosine ? decoded.data() : nullptr,
                 n_rows,
                 is_cosine,
-                dtype);
+                dtype,
+                stored_inv_norms);
     } else {
+        // Other SQ types (e.g. unsigned QT_8bit / SQ8) are decoded to fp32 and
+        // uploaded un-normalized; the stored original inverse norms are applied
+        // in the kernel, matching the CPU cosine computer for lossy codes.
         std::vector<float> h_vectors(n_rows * dim);
         sq_storage->sa_decode(
                 n_rows, sq_storage->codes.data(), h_vectors.data());
-        upload_fp32_dataset(*idx, h_vectors, n_rows, is_cosine);
+        upload_fp32_dataset(
+                *idx, h_vectors, n_rows, is_cosine, stored_inv_norms);
     }
 
     upload_graph_to_gpu(*idx, hnsw_index.hnsw, n_rows);
