@@ -61,8 +61,17 @@ namespace gpu {
 
 /// Extract HNSW graph layers from a Knowhere HNSW struct.
 /// Template parameter HnswT can be faiss::cppcontrib::knowhere::HNSW
-/// or faiss::HNSW — any type with neighbor_range(), nb_neighbors(),
-/// neighbors, levels, entry_point, max_level.
+/// or faiss::HNSW — any type exposing this interface:
+///   - neighbor_range(node, layer, &begin, &end)
+///   - nb_neighbors(layer) -> int
+///   - neighbors            : flat neighbor array indexed by neighbor_range
+///   - levels : per-node array; levels[i] is the 1-based layer count, so
+///              node i lives on layers 0..levels[i]-1 and "i is on layer L"
+///              is the test levels[i] > L
+///   - entry_point, max_level
+/// The levels[] convention above matches faiss::HNSW (HNSW.cpp uses
+/// pt_level = levels[i] - 1); a variant with different semantics would need a
+/// different membership test at the levels[i] > layer check below.
 template <typename HnswT>
 inline void extract_hnsw_layers(
         const HnswT& hnsw,

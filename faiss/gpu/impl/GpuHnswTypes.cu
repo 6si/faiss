@@ -140,6 +140,14 @@ GpuHnswScratchSlot* GpuHnswScratchPool::acquire() {
 }
 
 void GpuHnswScratchPool::release(GpuHnswScratchSlot* slot) {
+    // Safety net: ensure all GPU work on this slot's stream has completed
+    // before returning it to the pool. Callers (searchHost / searchImpl_)
+    // already synchronize before release, so this is normally a no-op; it
+    // guards a future caller that skips its own sync, whose in-flight buffers
+    // could otherwise be freed+realloced by the next acquirer's ensure()
+    // (use-after-free).
+    cudaSetDevice(device_);
+    cudaStreamSynchronize(slot->stream);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         available_.push_back(slot);

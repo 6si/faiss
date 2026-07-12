@@ -66,7 +66,18 @@ struct SearchParametersGpuHNSW : SearchParameters {
 /// parallel beam search kernel.
 ///
 /// Supports L2, inner product, and cosine metrics.
-/// Supports float32 and int8 (QT_8bit_direct_signed) data.
+/// Supports float32, fp16, bf16, and int8 (QT_8bit_direct_signed) data.
+/// Low-precision formats (int8/fp16/bf16) are kept in their native on-device
+/// byte layout and up-converted to fp32 per element inside the search kernel.
+///
+/// Two search entry points exist:
+///   - searchHost(): the path Knowhere uses. Host in/out pointers, a single
+///     device sync at the end. Preferred for production.
+///   - searchImpl_(): the faiss-standard GpuIndex::search() override. It does a
+///     D2H copy of labels, a CPU uint64->idx_t conversion, then an H2D copy
+///     back, with a stream sync on each side. Correct but not latency-optimal;
+///     a GPU-side label-conversion kernel to avoid the round-trip is a
+///     documented follow-up. Knowhere does not use this path.
 struct GpuIndexHNSW : public GpuIndex {
    public:
     GpuIndexHNSW(
@@ -80,7 +91,8 @@ struct GpuIndexHNSW : public GpuIndex {
     /// Load an HNSW index from CPU to GPU.
     /// The CPU index must have been built and trained already.
     /// Supports IndexHNSWFlat (float32) and IndexHNSWSQ
-    /// (QT_8bit_direct_signed for INT8, or dequantized for other SQ types).
+    /// (QT_8bit_direct_signed for INT8, QT_fp16/QT_bf16 kept native, or
+    /// dequantized for other SQ types).
     void copyFrom(const faiss::cppcontrib::knowhere::IndexHNSW* index);
 
     /// Like copyFrom(), but with the metric interpretation supplied by the
@@ -105,6 +117,9 @@ struct GpuIndexHNSW : public GpuIndex {
     /// All input/output pointers must be host memory.
     /// This avoids the GpuIndex::search_ex temp allocation chain
     /// which can cause SIGSEGV from pointer lifetime issues.
+    /// This is the preferred entry point (single device sync); prefer it
+    /// over the searchImpl_/GpuIndex::search() path, which round-trips the
+    /// labels D2H then H2D.
     void searchHost(
             idx_t n,
             const float* x_host,

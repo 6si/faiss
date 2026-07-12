@@ -153,6 +153,9 @@ struct GpuHnswDeviceIndex {
     int64_t n_rows = 0;
     int64_t dim = 0;
     uint32_t entry_point = 0;
+    // Total layer count (max_level + 1), informational only; the search path
+    // uses num_upper_layers_built (below) for the number of uploaded upper
+    // layers. Kept for diagnostics/logging.
     int num_layers = 0;
     int M = 0;
     int max_degree0 = 0;
