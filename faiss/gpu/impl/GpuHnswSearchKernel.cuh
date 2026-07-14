@@ -206,6 +206,131 @@ __global__ void upper_layer_search_kernel(
 }
 
 // ============================================================================
+// Phase 1: Parallel merge helpers (bitonic sort + parallel merge)
+// ============================================================================
+
+__device__ __forceinline__ void bitonic_sort_staging(
+        uint32_t* ids, float* dists, int active_count, int capacity) {
+    int i = threadIdx.x;
+    if (i < capacity && i >= active_count) {
+        ids[i] = UINT32_MAX;
+        dists[i] = FLT_MAX;
+    }
+    __syncthreads();
+
+    for (int k = 2; k <= capacity; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            int partner = i ^ j;
+            if (i < capacity && partner < capacity) {
+                // Each thread reads both its own slot and its partner's slot,
+                // then writes only to slot i — no thread writes to partner.
+                // Both threads in a pair do this symmetrically, so reads and
+                // writes of slot i are exclusively owned by thread i.
+                float di = dists[i], dp = dists[partner];
+                uint32_t ii = ids[i],  ip = ids[partner];
+                // Ascending sort when the direction bit (i & k) is 0.
+                // In ascending order: lower index should hold the smaller value.
+                bool ascending = ((i & k) == 0);
+                bool i_is_lower = (i < partner);
+                // i should hold the smaller value iff: ascending and i<partner,
+                //                                  or descending and i>partner.
+                bool want_smaller = ascending ? i_is_lower : !i_is_lower;
+                bool i_is_smaller = (di < dp) || (di == dp && ii < ip);
+                if (want_smaller != i_is_smaller) {
+                    dists[i] = dp;
+                    ids[i]   = ip;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+__device__ __forceinline__ void parallel_merge_into_result(
+        uint32_t* result_ids,
+        float* result_dists,
+        uint32_t* is_expanded,
+        uint32_t* staging_ids,
+        float* staging_dists,
+        uint32_t* merged_ids,
+        float* merged_dists,
+        uint32_t* merged_expanded,
+        int* meta,
+        int ef,
+        int max_staging) {
+    int sc = min(meta[1], max_staging);
+    int rc = meta[0];
+
+    bitonic_sort_staging(staging_ids, staging_dists, sc, max_staging);
+
+    int T = rc + sc;
+    int merge_limit = min(T, ef);
+
+    for (int pos = threadIdx.x; pos < merge_limit; pos += blockDim.x) {
+        // Binary search for si: number of staging elements ranked before pos.
+        // Valid range: si in [max(0,pos-rc), min(pos,sc)].
+        // Half-open: lo inclusive, hi exclusive = min(pos,sc)+1.
+        // ri = pos-si is always >= 0 within this range, but after exit si
+        // may equal min(pos,sc)+1 (all staging ranked first); guard ri reads.
+        int lo = max(0, pos - rc);
+        int hi = min(pos, sc) + 1;
+
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            // Clamp ri_mid to 0 to prevent negative-index speculative loads
+            // under compiler optimization; the predicate discards the value.
+            int ri_mid = max(0, pos - mid);
+            float sv = (mid < sc) ? staging_dists[mid] : FLT_MAX;
+            float rv = (ri_mid < rc) ? result_dists[ri_mid] : FLT_MAX;
+            uint32_t si_id = (mid < sc) ? staging_ids[mid] : UINT32_MAX;
+            uint32_t ri_id = (ri_mid < rc) ? result_ids[ri_mid] : UINT32_MAX;
+            // Override with sentinel if the true ri (pos-mid) would be negative
+            if (pos < mid) { rv = FLT_MAX; ri_id = UINT32_MAX; }
+            bool sv_le = (sv < rv) || (sv == rv && si_id < ri_id);
+            if (sv_le)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+
+        int si = lo;
+        // Clamp ri to 0 to prevent negative-index speculative loads;
+        // the ri_valid predicate gates whether the value is actually used.
+        int ri = pos - si;
+        bool ri_valid = (ri >= 0 && ri < rc);
+        int ri_safe = max(0, ri);
+
+        float sv = (si < sc) ? staging_dists[si] : FLT_MAX;
+        float rv = ri_valid ? result_dists[ri_safe] : FLT_MAX;
+        uint32_t si_id = (si < sc) ? staging_ids[si] : UINT32_MAX;
+        uint32_t ri_id = ri_valid ? result_ids[ri_safe] : UINT32_MAX;
+        bool take_staging = (si < sc) && (!ri_valid || (sv < rv) || (sv == rv && si_id < ri_id));
+
+        if (take_staging) {
+            merged_ids[pos] = si_id;
+            merged_dists[pos] = sv;
+            merged_expanded[pos] = 0;
+        } else {
+            merged_ids[pos] = ri_id;
+            merged_dists[pos] = rv;
+            merged_expanded[pos] = ri_valid ? is_expanded[ri_safe] : 0;
+        }
+    }
+    __syncthreads();
+
+    int new_rc = min(T, ef);
+    for (int i = threadIdx.x; i < new_rc; i += blockDim.x) {
+        result_ids[i] = merged_ids[i];
+        result_dists[i] = merged_dists[i];
+        is_expanded[i] = merged_expanded[i];
+    }
+    if (threadIdx.x == 0) {
+        meta[0] = new_rc;
+    }
+    __syncthreads();
+}
+
+// ============================================================================
 // Phase 2: Layer-0 parallel beam search kernel
 // ============================================================================
 
@@ -255,6 +380,9 @@ __global__ void layer0_beam_search_kernel(
     uint32_t* parent_ids =
             reinterpret_cast<uint32_t*>(staging_dists + max_staging);
     int* meta = reinterpret_cast<int*>(parent_ids + search_width);
+    uint32_t* merged_ids = reinterpret_cast<uint32_t*>(meta + 3);
+    float* merged_dists = reinterpret_cast<float*>(merged_ids + ef);
+    uint32_t* merged_expanded = reinterpret_cast<uint32_t*>(merged_dists + ef);
 
     int bitmap_words = (N + 31) / 32;
     uint32_t* visited_bmap =
@@ -324,44 +452,19 @@ __global__ void layer0_beam_search_kernel(
     }
     __syncthreads();
 
+    parallel_merge_into_result(
+            result_ids, result_dists, is_expanded,
+            staging_ids, staging_dists,
+            merged_ids, merged_dists, merged_expanded,
+            meta, ef, max_staging);
     if (threadIdx.x == 0) {
-        int staging_count = min(meta[1], max_staging);
         int rc = meta[0];
-
-        for (int s = 0; s < staging_count; s++) {
-            uint32_t sid = staging_ids[s];
-            float sdist = staging_dists[s];
-            if (rc >= ef && sdist >= result_dists[rc - 1])
-                continue;
-
-            int lo = 0, hi = rc;
-            while (lo < hi) {
-                int mid = (lo + hi) / 2;
-                if (result_dists[mid] < sdist)
-                    lo = mid + 1;
-                else
-                    hi = mid;
-            }
-            int insert_end = rc < ef ? rc : ef - 1;
-            for (int i = insert_end; i > lo; i--) {
-                result_ids[i] = result_ids[i - 1];
-                result_dists[i] = result_dists[i - 1];
-                is_expanded[i] = is_expanded[i - 1];
-            }
-            result_ids[lo] = sid;
-            result_dists[lo] = sdist;
-            is_expanded[lo] = 0;
-            if (rc < ef)
-                rc++;
-        }
-
         for (int i = 0; i < rc; i++) {
             if (result_ids[i] == ep) {
                 is_expanded[i] = 1;
                 break;
             }
         }
-        meta[0] = rc;
     }
     __syncthreads();
 
@@ -423,40 +526,11 @@ __global__ void layer0_beam_search_kernel(
         }
         __syncthreads();
 
-        if (threadIdx.x == 0) {
-            int staging_count = min(meta[1], max_staging);
-            int rc = meta[0];
-
-            for (int s = 0; s < staging_count; s++) {
-                uint32_t sid = staging_ids[s];
-                float sdist = staging_dists[s];
-                if (rc >= ef && sdist >= result_dists[rc - 1])
-                    continue;
-
-                int lo = 0, hi = rc;
-                while (lo < hi) {
-                    int mid = (lo + hi) / 2;
-                    if (result_dists[mid] < sdist)
-                        lo = mid + 1;
-                    else
-                        hi = mid;
-                }
-                int insert_end = rc < ef ? rc : ef - 1;
-                for (int i = insert_end; i > lo; i--) {
-                    result_ids[i] = result_ids[i - 1];
-                    result_dists[i] = result_dists[i - 1];
-                    is_expanded[i] = is_expanded[i - 1];
-                }
-                result_ids[lo] = sid;
-                result_dists[lo] = sdist;
-                is_expanded[lo] = 0;
-                if (rc < ef)
-                    rc++;
-            }
-
-            meta[0] = rc;
-        }
-        __syncthreads();
+        parallel_merge_into_result(
+                result_ids, result_dists, is_expanded,
+                staging_ids, staging_dists,
+                merged_ids, merged_dists, merged_expanded,
+                meta, ef, max_staging);
 
         // Stagnation detected when num_parents==0 (all expanded) → break above
     }
@@ -480,13 +554,16 @@ inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0) {
     int max_staging = search_width * max_degree0;
 
     size_t size = 0;
-    size += ef * sizeof(uint32_t);
-    size += ef * sizeof(float);
-    size += ef * sizeof(uint32_t);
-    size += max_staging * sizeof(uint32_t);
-    size += max_staging * sizeof(float);
-    size += search_width * sizeof(uint32_t);
-    size += 3 * sizeof(int);
+    size += ef * sizeof(uint32_t);           // result_ids
+    size += ef * sizeof(float);              // result_dists
+    size += ef * sizeof(uint32_t);           // is_expanded
+    size += max_staging * sizeof(uint32_t);  // staging_ids
+    size += max_staging * sizeof(float);     // staging_dists
+    size += search_width * sizeof(uint32_t); // parent_ids
+    size += 3 * sizeof(int);                 // meta
+    size += ef * sizeof(uint32_t);           // merged_ids
+    size += ef * sizeof(float);              // merged_dists
+    size += ef * sizeof(uint32_t);           // merged_expanded
     return size;
 }
 

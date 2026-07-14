@@ -126,12 +126,19 @@ inline void gpu_hnsw_search(
         }
 
         {
+            int max_staging_check = sw * idx.max_degree0;
+            if (max_staging_check > block_size ||
+                (max_staging_check & (max_staging_check - 1)) != 0) {
+                throw std::runtime_error(
+                        std::string("gpu_hnsw: search_width * max_degree0 = ") +
+                        std::to_string(max_staging_check) +
+                        " must be a power of 2 and <= block_size (" +
+                        std::to_string(block_size) + ") for parallel merge");
+            }
+            // Fixed overhead: staging (sw*deg0*8) + parent_ids (sw*4) + meta (12)
             int smem_overhead = sw * idx.max_degree0 * 8 + sw * 4 + 12;
-            int max_ef = (smem_max - smem_overhead) / 12;
-            // A search_width so large that even ef=1 does not fit in shared
-            // memory leaves no valid beam. Fail clearly rather than clamping ef
-            // to a negative/zero value (which would launch with a bad geometry
-            // or read out of bounds).
+            // Per-ef cost: 3 result arrays + 3 merge arrays = 6 × 4 = 24 bytes/slot
+            int max_ef = (smem_max - smem_overhead) / 24;
             if (max_ef < 1) {
                 throw std::runtime_error(
                         std::string("gpu_hnsw: search_width=") +
