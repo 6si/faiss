@@ -492,15 +492,24 @@ __global__ void layer0_beam_search_kernel(
 
     // --- Seed with entry point ---
     uint32_t ep = d_entry_points[query_idx];
+    // Defensive: the entry point must be a real node (< N) before it indexes
+    // the dataset (ep_dist) or the layer-0 graph (neighbor seeding). A bad ep
+    // would otherwise fault far out of bounds. On the healthy path ep is always
+    // valid; if it is not, seed nothing and let the search return sentinels.
+    bool ep_valid = (ep < static_cast<uint32_t>(N));
     if (threadIdx.x == 0) {
-        float ep_dist = layer0_distance<DataT, QueryT, USE_DP4A>(
-                query, d_dataset, d_inv_norms, ep, dim, dim4,
-                use_inner_product);
-        result_ids[0] = ep;
-        result_dists[0] = ep_dist;
-        is_expanded[0] = 0;
-        meta[0] = 1;
-        bitmap_visit(visited_bmap, ep);
+        if (ep_valid) {
+            float ep_dist = layer0_distance<DataT, QueryT, USE_DP4A>(
+                    query, d_dataset, d_inv_norms, ep, dim, dim4,
+                    use_inner_product);
+            result_ids[0] = ep;
+            result_dists[0] = ep_dist;
+            is_expanded[0] = 0;
+            meta[0] = 1;
+            bitmap_visit(visited_bmap, ep);
+        } else {
+            meta[0] = 0;
+        }
     }
     __syncthreads();
 
@@ -509,7 +518,7 @@ __global__ void layer0_beam_search_kernel(
         meta[1] = 0;
     __syncthreads();
 
-    for (int j = threadIdx.x; j < max_degree0; j += blockDim.x) {
+    for (int j = threadIdx.x; ep_valid && j < max_degree0; j += blockDim.x) {
         uint32_t nbr =
                 d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j];
         if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
@@ -576,6 +585,14 @@ __global__ void layer0_beam_search_kernel(
             int nbr_slot = wi % max_degree0;
 
             uint32_t parent = parent_ids[parent_idx];
+            // Defensive: a parent id must be a real node (< N). result_ids only
+            // ever holds the entry point or graph neighbors (both < N) once the
+            // merge is correct, so this never fires on the healthy path; it caps
+            // a stray/garbage id at O(N) instead of letting it index the graph
+            // at parent*max_degree0 and fault far out of bounds. Mirrors the
+            // neighbor guard below.
+            if (parent >= static_cast<uint32_t>(N))
+                continue;
             uint32_t nbr =
                     d_layer0_graph
                                   [static_cast<int64_t>(parent) * max_degree0 +
@@ -609,7 +626,7 @@ __global__ void layer0_beam_search_kernel(
     // --- Copy top-k results to global memory ---
     int rc = meta[0];
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        if (i < rc) {
+        if (i < rc && result_ids[i] < static_cast<uint32_t>(N)) {
             d_neighbors[static_cast<int64_t>(query_idx) * k + i] =
                     static_cast<uint64_t>(result_ids[i]);
             d_distances[static_cast<int64_t>(query_idx) * k + i] =
