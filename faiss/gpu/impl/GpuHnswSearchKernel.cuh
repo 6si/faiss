@@ -288,13 +288,25 @@ __device__ __forceinline__ void bitonic_sort_staging(
     for (int k = 2; k <= capacity; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
             int partner = i ^ j;
+            // Compare-exchange in two barrier-separated phases. Each thread
+            // owns writes to slot i only, but it READS slot `partner` — which
+            // another thread owns and may overwrite in the SAME phase. When the
+            // partner is in a different warp (j >= warpSize) the read and that
+            // write are unsynchronized -> a shared-memory hazard (racecheck
+            // flagged ~1.6M in the half kernel). So: (1) every thread reads its
+            // pair into registers and decides whether to swap, (2) __syncthreads
+            // so all reads complete before any write, (3) threads that must swap
+            // write their own slot, (4) __syncthreads before the next phase's
+            // reads. Loop bounds (k, j) are uniform across the block, so every
+            // thread — including i >= capacity — reaches every barrier.
+            float dp = 0.0f;
+            uint32_t ip = 0u;
+            bool do_swap = false;
             if (i < capacity && partner < capacity) {
-                // Each thread reads both its own slot and its partner's slot,
-                // then writes only to slot i — no thread writes to partner.
-                // Both threads in a pair do this symmetrically, so reads and
-                // writes of slot i are exclusively owned by thread i.
-                float di = dists[i], dp = dists[partner];
-                uint32_t ii = ids[i],  ip = ids[partner];
+                float di = dists[i];
+                dp = dists[partner];
+                uint32_t ii = ids[i];
+                ip = ids[partner];
                 // Ascending sort when the direction bit (i & k) is 0.
                 // In ascending order: lower index should hold the smaller value.
                 bool ascending = ((i & k) == 0);
@@ -303,10 +315,12 @@ __device__ __forceinline__ void bitonic_sort_staging(
                 //                                  or descending and i>partner.
                 bool want_smaller = ascending ? i_is_lower : !i_is_lower;
                 bool i_is_smaller = (di < dp) || (di == dp && ii < ip);
-                if (want_smaller != i_is_smaller) {
-                    dists[i] = dp;
-                    ids[i]   = ip;
-                }
+                do_swap = (want_smaller != i_is_smaller);
+            }
+            __syncthreads();
+            if (do_swap) {
+                dists[i] = dp;
+                ids[i] = ip;
             }
             __syncthreads();
         }
