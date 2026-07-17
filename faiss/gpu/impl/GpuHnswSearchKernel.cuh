@@ -78,6 +78,73 @@ __device__ __forceinline__ float thread_ip_distance(
     return -sum;
 }
 
+// Native int8 inner-product distance using DP4A (4 int8 MADs/cycle, SM_61+).
+// Both query and vec must point at int8 data reinterpreted as packed int32,
+// i.e. dim4 == dim / 4 (dim must be a multiple of 4). Returns the negated dot
+// product to match thread_ip_distance()'s convention (smaller == closer).
+__device__ __forceinline__ float thread_ip_distance_dp4a(
+        const int32_t* __restrict__ query_packed,
+        const int32_t* __restrict__ vec_packed,
+        int dim4) {
+    int sum = 0;
+#pragma unroll 8
+    for (int d = 0; d < dim4; d++) {
+        sum = __dp4a(query_packed[d], vec_packed[d], sum);
+    }
+    return static_cast<float>(-sum);
+}
+
+// Smallest power of two >= x (x >= 1). Used to pad the staging capacity so the
+// bitonic sort (which requires a power-of-two capacity) never rejects graphs
+// whose search_width * max_degree0 is not already a power of two.
+__host__ __device__ __forceinline__ int next_pow2_int(int x) {
+    int p = 1;
+    while (p < x)
+        p <<= 1;
+    return p;
+}
+
+// Padded staging capacity: power-of-two >= search_width * max_degree0.
+__host__ __device__ __forceinline__ int padded_staging_capacity(
+        int search_width,
+        int max_degree0) {
+    return next_pow2_int(search_width * max_degree0);
+}
+
+// Unified layer-0 distance: DP4A for native int8+IP, generic fp32 path
+// otherwise. The branch is resolved at compile time so only the relevant
+// distance function is instantiated for each specialization.
+template <typename DataT, typename QueryT, bool USE_DP4A>
+__device__ __forceinline__ float layer0_distance(
+        const QueryT* __restrict__ query,
+        const DataT* __restrict__ d_dataset,
+        const float* __restrict__ d_inv_norms,
+        uint32_t id,
+        int dim,
+        int dim4,
+        bool use_inner_product) {
+    if constexpr (USE_DP4A) {
+        const int32_t* vec_packed = reinterpret_cast<const int32_t*>(
+                d_dataset + static_cast<int64_t>(id) * dim);
+        float dist = thread_ip_distance_dp4a(
+                reinterpret_cast<const int32_t*>(query), vec_packed, dim4);
+        if (d_inv_norms)
+            dist *= __ldg(&d_inv_norms[id]);
+        return dist;
+    } else {
+        const DataT* vec = d_dataset + static_cast<int64_t>(id) * dim;
+        float dist;
+        if (use_inner_product) {
+            dist = thread_ip_distance(query, vec, dim);
+            if (d_inv_norms)
+                dist *= __ldg(&d_inv_norms[id]);
+        } else {
+            dist = thread_l2_distance(query, vec, dim);
+        }
+        return dist;
+    }
+}
+
 // ============================================================================
 // Phase 1: Upper-layer greedy search
 // ============================================================================
@@ -343,9 +410,12 @@ __device__ __forceinline__ bool bitmap_visit(
     return (old & bit) == 0;
 }
 
-template <typename DataT>
+// Templated on the dataset element type (DataT), the query element type
+// (QueryT: float for the generic path, int8_t for the native DP4A path), and
+// USE_DP4A which selects the DP4A int8 inner-product distance at compile time.
+template <typename DataT, typename QueryT, bool USE_DP4A>
 __global__ void layer0_beam_search_kernel(
-        const float* __restrict__ d_queries,
+        const QueryT* __restrict__ d_queries,
         const DataT* __restrict__ d_dataset,
         const float* __restrict__ d_inv_norms,
         const uint32_t* __restrict__ d_layer0_graph,
@@ -366,11 +436,14 @@ __global__ void layer0_beam_search_kernel(
     if (query_idx >= num_queries)
         return;
 
-    const float* query = d_queries + static_cast<int64_t>(query_idx) * dim;
+    const QueryT* query = d_queries + static_cast<int64_t>(query_idx) * dim;
+    int dim4 = dim / 4;
 
     extern __shared__ char smem[];
 
-    int max_staging = search_width * max_degree0;
+    // Pad to a power of two so the bitonic sort in parallel_merge_into_result
+    // has a valid capacity for any max_degree0 (e.g. non-power-of-two 2*M).
+    int max_staging = padded_staging_capacity(search_width, max_degree0);
 
     uint32_t* result_ids = reinterpret_cast<uint32_t*>(smem);
     float* result_dists = reinterpret_cast<float*>(result_ids + ef);
@@ -403,16 +476,9 @@ __global__ void layer0_beam_search_kernel(
     // --- Seed with entry point ---
     uint32_t ep = d_entry_points[query_idx];
     if (threadIdx.x == 0) {
-        float ep_dist;
-        if (use_inner_product) {
-            ep_dist = thread_ip_distance(
-                    query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
-            if (d_inv_norms)
-                ep_dist *= __ldg(&d_inv_norms[ep]);
-        } else {
-            ep_dist = thread_l2_distance(
-                    query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
-        }
+        float ep_dist = layer0_distance<DataT, QueryT, USE_DP4A>(
+                query, d_dataset, d_inv_norms, ep, dim, dim4,
+                use_inner_product);
         result_ids[0] = ep;
         result_dists[0] = ep_dist;
         is_expanded[0] = 0;
@@ -434,15 +500,9 @@ __global__ void layer0_beam_search_kernel(
         if (!bitmap_visit(visited_bmap, nbr))
             continue;
 
-        const DataT* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
-        float dist;
-        if (use_inner_product) {
-            dist = thread_ip_distance(query, nbr_vec, dim);
-            if (d_inv_norms)
-                dist *= d_inv_norms[nbr];
-        } else {
-            dist = thread_l2_distance(query, nbr_vec, dim);
-        }
+        float dist = layer0_distance<DataT, QueryT, USE_DP4A>(
+                query, d_dataset, d_inv_norms, nbr, dim, dim4,
+                use_inner_product);
 
         int slot = atomicAdd(&meta[1], 1);
         if (slot < max_staging) {
@@ -508,15 +568,9 @@ __global__ void layer0_beam_search_kernel(
             if (!bitmap_visit(visited_bmap, nbr))
                 continue;
 
-            const DataT* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
-            float dist;
-            if (use_inner_product) {
-                dist = thread_ip_distance(query, nbr_vec, dim);
-                if (d_inv_norms)
-                    dist *= d_inv_norms[nbr];
-            } else {
-                dist = thread_l2_distance(query, nbr_vec, dim);
-            }
+            float dist = layer0_distance<DataT, QueryT, USE_DP4A>(
+                    query, d_dataset, d_inv_norms, nbr, dim, dim4,
+                    use_inner_product);
 
             int slot = atomicAdd(&meta[1], 1);
             if (slot < max_staging) {
@@ -551,7 +605,8 @@ __global__ void layer0_beam_search_kernel(
 }
 
 inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0) {
-    int max_staging = search_width * max_degree0;
+    // Must match the kernel's padded staging capacity exactly.
+    int max_staging = padded_staging_capacity(search_width, max_degree0);
 
     size_t size = 0;
     size += ef * sizeof(uint32_t);           // result_ids

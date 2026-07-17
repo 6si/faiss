@@ -96,18 +96,20 @@ struct GpuHnswSearchScratch {
     float* d_distances = nullptr;
     uint32_t* d_entry_points = nullptr;
     uint32_t* d_visited_bitmaps = nullptr;
+    int8_t* d_queries_i8 = nullptr; // int8 queries for the native DP4A path
 
     size_t queries_bytes = 0;
     size_t neighbors_bytes = 0;
     size_t distances_bytes = 0;
     int entry_cap = 0;
     size_t bitmap_bytes = 0;
+    size_t queries_i8_bytes = 0;
 
     // Device this scratch's allocations live on; used to set the CUDA device
     // context before freeing in the destructor (multi-GPU correctness).
     int device = 0;
 
-    void ensure(int nq, int k, int dim, int N);
+    void ensure(int nq, int k, int dim, int N, bool use_i8_queries = false);
 
     ~GpuHnswSearchScratch();
 

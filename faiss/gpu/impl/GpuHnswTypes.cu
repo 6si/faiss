@@ -48,7 +48,8 @@ void GpuHnswSearchScratch::ensure(
         int nq,
         int k,
         int dim,
-        int N) {
+        int N,
+        bool use_i8_queries) {
     size_t need_q = static_cast<size_t>(nq) * dim * sizeof(float);
     if (need_q > queries_bytes) {
         if (d_queries)
@@ -87,6 +88,15 @@ void GpuHnswSearchScratch::ensure(
         SCRATCH_CUDA_CHECK(cudaMalloc(&d_visited_bitmaps, need_bm));
         bitmap_bytes = need_bm;
     }
+    if (use_i8_queries) {
+        size_t need_i8 = static_cast<size_t>(nq) * dim * sizeof(int8_t);
+        if (need_i8 > queries_i8_bytes) {
+            if (d_queries_i8)
+                cudaFree(d_queries_i8);
+            SCRATCH_CUDA_CHECK(cudaMalloc(&d_queries_i8, need_i8));
+            queries_i8_bytes = need_i8;
+        }
+    }
 }
 
 GpuHnswSearchScratch::~GpuHnswSearchScratch() {
@@ -103,6 +113,8 @@ GpuHnswSearchScratch::~GpuHnswSearchScratch() {
         cudaFree(d_entry_points);
     if (d_visited_bitmaps)
         cudaFree(d_visited_bitmaps);
+    if (d_queries_i8)
+        cudaFree(d_queries_i8);
 }
 
 GpuHnswScratchSlot::~GpuHnswScratchSlot() {
