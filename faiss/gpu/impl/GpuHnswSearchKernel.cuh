@@ -344,15 +344,32 @@ __device__ __forceinline__ void parallel_merge_into_result(
 
         while (lo < hi) {
             int mid = (lo + hi) / 2;
-            // Clamp ri_mid to 0 to prevent negative-index speculative loads
-            // under compiler optimization; the predicate discards the value.
-            int ri_mid = max(0, pos - mid);
+            // Merge-path diagonal test: staging[mid] is taken ahead of the
+            // result element it would displace, which is result[pos-mid-1]
+            // (NOT result[pos-mid]). Getting this index wrong mis-partitions
+            // every merge (empirically ~4% recall) and can promote a padded
+            // UINT32_MAX sentinel into the result list, which is later used as
+            // a graph/dataset index -> illegal memory access.
+            int ri_mid = pos - mid - 1;
+            bool ri_mid_valid = (ri_mid >= 0 && ri_mid < rc);
+            int ri_mid_safe = max(0, ri_mid);
             float sv = (mid < sc) ? staging_dists[mid] : FLT_MAX;
-            float rv = (ri_mid < rc) ? result_dists[ri_mid] : FLT_MAX;
             uint32_t si_id = (mid < sc) ? staging_ids[mid] : UINT32_MAX;
-            uint32_t ri_id = (ri_mid < rc) ? result_ids[ri_mid] : UINT32_MAX;
-            // Override with sentinel if the true ri (pos-mid) would be negative
-            if (pos < mid) { rv = FLT_MAX; ri_id = UINT32_MAX; }
+            float rv;
+            uint32_t ri_id;
+            if (ri_mid < 0) {
+                // No result element precedes this split: staging[mid] must not
+                // be taken ahead of it -> compare against -inf (predicate false).
+                rv = -FLT_MAX;
+                ri_id = 0u;
+            } else if (ri_mid_valid) {
+                rv = result_dists[ri_mid_safe];
+                ri_id = result_ids[ri_mid_safe];
+            } else {
+                // ri_mid >= rc: no result element there -> +inf (take staging).
+                rv = FLT_MAX;
+                ri_id = UINT32_MAX;
+            }
             bool sv_le = (sv < rv) || (sv == rv && si_id < ri_id);
             if (sv_le)
                 lo = mid + 1;
