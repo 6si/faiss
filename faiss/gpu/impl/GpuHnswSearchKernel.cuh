@@ -402,7 +402,8 @@ __device__ __forceinline__ void parallel_merge_into_result(
         float rv = ri_valid ? result_dists[ri_safe] : FLT_MAX;
         uint32_t si_id = (si < sc) ? staging_ids[si] : UINT32_MAX;
         uint32_t ri_id = ri_valid ? result_ids[ri_safe] : UINT32_MAX;
-        bool take_staging = (si < sc) && (!ri_valid || (sv < rv) || (sv == rv && si_id < ri_id));
+        bool take_staging = (si < sc) &&
+                (!ri_valid || (sv < rv) || (sv == rv && si_id < ri_id));
 
         if (take_staging) {
             merged_ids[pos] = si_id;
@@ -638,16 +639,25 @@ __global__ void layer0_beam_search_kernel(
     }
 
     // --- Copy top-k results to global memory ---
+    // The beam search works internally with a "smaller == closer" convention:
+    // thread_ip_distance() returns the negated dot product so inner-product and
+    // cosine can share the same min-first ordering as L2. Negate back on
+    // copy-out for those metrics so callers receive the true similarity score
+    // (faiss's METRIC_INNER_PRODUCT contract is "larger == closer"). L2 is
+    // already a genuine distance and is copied verbatim. Empty slots use the
+    // worst score for the metric (-FLT_MAX for IP/cosine, +FLT_MAX for L2) so
+    // they always sort last regardless of the caller's ordering.
     int rc = meta[0];
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
         if (i < rc && result_ids[i] < static_cast<uint32_t>(N)) {
             d_neighbors[static_cast<int64_t>(query_idx) * k + i] =
                     static_cast<uint64_t>(result_ids[i]);
             d_distances[static_cast<int64_t>(query_idx) * k + i] =
-                    result_dists[i];
+                    use_inner_product ? -result_dists[i] : result_dists[i];
         } else {
             d_neighbors[static_cast<int64_t>(query_idx) * k + i] = UINT64_MAX;
-            d_distances[static_cast<int64_t>(query_idx) * k + i] = FLT_MAX;
+            d_distances[static_cast<int64_t>(query_idx) * k + i] =
+                    use_inner_product ? -FLT_MAX : FLT_MAX;
         }
     }
 }

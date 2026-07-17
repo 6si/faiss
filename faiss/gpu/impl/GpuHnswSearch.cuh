@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -60,6 +61,24 @@ inline void gpu_hnsw_search(
 
     int ef = params.ef;
     int sw = params.search_width;
+    // Reject degenerate params up front: ef and search_width feed the
+    // shared-memory sizing and the auto-iteration bound (2*ef/sw below), so a
+    // value of 0 would divide by zero and a negative value would under-size
+    // the buffers.
+    if (ef <= 0 || sw <= 0) {
+        throw std::runtime_error(
+                std::string("gpu_hnsw: ef and search_width must be > 0 (ef=") +
+                std::to_string(ef) + ", search_width=" + std::to_string(sw) +
+                ")");
+    }
+    // Auto-clamp ef up to k. The kernel tracks exactly ef candidates in the
+    // result beam, so ef < k could only ever return ef real neighbors with the
+    // remaining k-ef slots padded with sentinels. Raising ef to k matches the
+    // CPU / Knowhere HNSW contract (always return k valid results). The
+    // shared-memory-fit check below still throws if even k slots cannot fit.
+    if (k > ef) {
+        ef = k;
+    }
     int max_iter = params.max_iterations > 0
             ? params.max_iterations
             : 2 * ef / sw + 10;
@@ -160,6 +179,18 @@ inline void gpu_hnsw_search(
                         std::to_string(smem_max) +
                         " bytes); reduce search_width");
             }
+            // ef was auto-clamped up to at least k above. If even k candidate
+            // slots cannot fit in shared memory, fail loudly rather than
+            // silently returning fewer than k valid results.
+            if (k > max_ef) {
+                throw std::runtime_error(
+                        std::string("gpu_hnsw: k=") + std::to_string(k) +
+                        " needs k candidate slots (ef>=k), only " +
+                        std::to_string(max_ef) +
+                        " fit in device shared memory (" +
+                        std::to_string(smem_max) +
+                        " bytes); reduce k or raise thread_block_size");
+            }
             if (ef > max_ef) {
                 fprintf(stderr,
                         "[gpu_hnsw] warning: ef=%d exceeds the per-block "
@@ -175,13 +206,22 @@ inline void gpu_hnsw_search(
                 ef, sw, idx.max_degree0);
 
         // Opt into >48 KiB dynamic shared memory when the device supports it;
-        // without this the kernel launch would fail for large ef.
+        // without this the kernel launch would fail for large ef. This is
+        // cached per kernel instantiation: cudaFuncSetAttribute configures the
+        // kernel's max dynamic shared memory globally, so it only needs to run
+        // once per (kernel, high-water size) rather than on every search. The
+        // static lives in this generic-lambda body, which is instantiated once
+        // per <DataT, QueryT, USE_DP4A> combination.
         if (smem_size > 49152) {
-            GPU_HNSW_CUDA_CHECK(cudaFuncSetAttribute(
-                    hnsw_kernel::layer0_beam_search_kernel<
-                            DataT, QueryT, USE_DP4A>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    static_cast<int>(smem_size)));
+            static std::atomic<size_t> configured_smem{0};
+            if (smem_size > configured_smem.load(std::memory_order_relaxed)) {
+                GPU_HNSW_CUDA_CHECK(cudaFuncSetAttribute(
+                        hnsw_kernel::layer0_beam_search_kernel<
+                                DataT, QueryT, USE_DP4A>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(smem_size)));
+                configured_smem.store(smem_size, std::memory_order_relaxed);
+            }
         }
 
         int N_int = static_cast<int>(idx.n_rows);

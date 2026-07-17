@@ -26,8 +26,8 @@
 #include <faiss/gpu/GpuIndex.h>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
 
-#include <atomic>
 #include <memory>
+#include <mutex>
 
 namespace faiss {
 
@@ -121,10 +121,11 @@ struct GpuIndexHNSW : public GpuIndex {
     /// over the searchImpl_/GpuIndex::search() path, which round-trips the
     /// labels D2H then H2D.
     ///
-    /// Distance convention: for inner-product and cosine metrics the returned
-    /// distances are the *negated* dot product (smaller == more similar), so
-    /// callers that want raw similarity scores must negate them (Knowhere does
-    /// this on the way out). L2 distances are returned as-is.
+    /// Distance convention: inner-product and cosine metrics return the true
+    /// similarity score (larger == more similar), matching faiss's
+    /// METRIC_INNER_PRODUCT contract. Internally the kernel keeps a negated
+    /// (smaller == more similar) score for a uniform min-first ordering and
+    /// negates it back on copy-out. L2 distances are returned as-is.
     void searchHost(
             idx_t n,
             const float* x_host,
@@ -138,8 +139,9 @@ struct GpuIndexHNSW : public GpuIndex {
     /// verbatim — no bias/shift is applied, matching the dataset upload which
     /// already reverses FAISS's +128 SQ bias. When dim % 4 != 0 (DP4A requires
     /// groups of four int8 lanes) this transparently falls back to the fp32
-    /// searchHost() path. Same negated IP/cosine distance convention as
-    /// searchHost(). All input/output pointers must be host memory.
+    /// searchHost() path. Same IP/cosine distance convention as searchHost()
+    /// (true similarity returned). All input/output pointers must be host
+    /// memory.
     void searchHostInt8(
             idx_t n,
             const int8_t* x_host,

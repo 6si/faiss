@@ -118,6 +118,10 @@ GpuHnswSearchScratch::~GpuHnswSearchScratch() {
 }
 
 GpuHnswScratchSlot::~GpuHnswScratchSlot() {
+    // Set the owning device before destroying the stream so it runs in the
+    // correct context on multi-GPU systems (scratch.device is assigned when the
+    // slot is created in GpuHnswScratchPool::init_once()).
+    cudaSetDevice(scratch.device);
     if (stream)
         cudaStreamDestroy(stream);
 }
