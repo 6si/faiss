@@ -28,8 +28,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -210,17 +210,28 @@ inline void gpu_hnsw_search(
         // cached per kernel instantiation: cudaFuncSetAttribute configures the
         // kernel's max dynamic shared memory globally, so it only needs to run
         // once per (kernel, high-water size) rather than on every search. The
-        // static lives in this generic-lambda body, which is instantiated once
+        // statics live in this generic-lambda body, which is instantiated once
         // per <DataT, QueryT, USE_DP4A> combination.
+        //
+        // The mutex makes the check-set-store atomic and monotonic: without it,
+        // two concurrent searches with different smem sizes can interleave so a
+        // smaller-ef search's cudaFuncSetAttribute runs *after* a larger one,
+        // downgrading the kernel's global attribute below what a recorded
+        // high-water mark implies, and a later intermediate search then skips
+        // the set (thinks it's configured) and fails to launch. Under the lock
+        // the attribute only ever grows, and is always >= the current launch's
+        // requirement before we proceed.
         if (smem_size > 49152) {
-            static std::atomic<size_t> configured_smem{0};
-            if (smem_size > configured_smem.load(std::memory_order_relaxed)) {
+            static std::mutex configured_smem_mutex;
+            static size_t configured_smem = 0;
+            std::lock_guard<std::mutex> lock(configured_smem_mutex);
+            if (smem_size > configured_smem) {
                 GPU_HNSW_CUDA_CHECK(cudaFuncSetAttribute(
                         hnsw_kernel::layer0_beam_search_kernel<
                                 DataT, QueryT, USE_DP4A>,
                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                         static_cast<int>(smem_size)));
-                configured_smem.store(smem_size, std::memory_order_relaxed);
+                configured_smem = smem_size;
             }
         }
 

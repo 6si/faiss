@@ -68,6 +68,9 @@ void GpuIndexHNSW::copyFrom(
     bool use_ip =
             is_cosine || (index->metric_type == faiss::METRIC_INNER_PRODUCT);
 
+    is_cosine_ = is_cosine;
+    use_ip_ = use_ip;
+
     if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
         deviceIndex_ =
                 from_faiss_hnsw_sq(*index, use_ip, is_cosine, config_.device);
@@ -91,6 +94,9 @@ void GpuIndexHNSW::copyFromWithMetric(
     this->d = index->d;
     this->metric_type = index->metric_type;
     this->ntotal = index->ntotal;
+
+    is_cosine_ = is_cosine;
+    use_ip_ = use_ip;
 
     if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
         deviceIndex_ =

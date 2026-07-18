@@ -95,6 +95,16 @@ inline void extract_hnsw_layers(
     const int maxM = hnsw.nb_neighbors(1);
     const int max_lv = hnsw.max_level;
 
+    // The kernels dereference d_dataset + entry_point * dim directly, so a
+    // malformed CPU index carrying an invalid/sentinel entry_point (e.g. -1
+    // cast to UINT32_MAX) would be an out-of-bounds device read. Validate here
+    // rather than faulting on the GPU.
+    if (hnsw.entry_point < 0 || hnsw.entry_point >= n_rows) {
+        throw std::runtime_error(
+                std::string("gpu_hnsw: invalid HNSW entry_point ") +
+                std::to_string(static_cast<long long>(hnsw.entry_point)) +
+                " (n_rows=" + std::to_string(n_rows) + ")");
+    }
     entry_point = static_cast<uint32_t>(hnsw.entry_point);
     M = maxM;
     max_degree0 = maxM0;

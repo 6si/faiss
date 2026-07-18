@@ -150,6 +150,18 @@ struct GpuIndexHNSW : public GpuIndex {
             idx_t* labels_host,
             const GpuHnswSearchParams& params) const;
 
+    /// Metric interpretation captured at copyFrom()/copyFromWithMetric() time
+    /// from the FAISS index type, so callers can post-process results (cosine
+    /// query normalization, IP handling) without re-deriving the metric from a
+    /// per-search config — the config may omit metric_type and default to L2,
+    /// which would silently mishandle a cosine/IP index.
+    bool isCosine() const {
+        return is_cosine_;
+    }
+    bool useInnerProduct() const {
+        return use_ip_;
+    }
+
    protected:
     bool addImplRequiresIDs_() const override;
 
@@ -171,6 +183,10 @@ struct GpuIndexHNSW : public GpuIndex {
     mutable std::mutex searchParamsMutex_;
     mutable GpuHnswSearchParams directSearchParams_;
     mutable bool hasDirectSearchParams_ = false;
+
+    // Metric interpretation, set at copy time (see isCosine()/useInnerProduct()).
+    bool is_cosine_ = false;
+    bool use_ip_ = false;
 };
 
 } // namespace gpu
