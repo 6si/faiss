@@ -100,6 +100,11 @@ void GpuHnswSearchScratch::ensure(
 }
 
 void GpuHnswSearchScratch::ensure_filter(int nq, size_t bitset_bytes_needed) {
+    // Bind this scratch slot's owning device before allocating so cudaMalloc
+    // lands on the right GPU even if the active device was changed elsewhere
+    // (matches the destructor). searchHost already sets it, but keep the
+    // allocation self-contained on multi-GPU systems.
+    cudaSetDevice(device);
     // Device bitset: reallocate when the segment row count (hence the byte
     // count) grows. ensure() is called per search with the current n_rows, so
     // a segment that gains rows via reload re-sizes the bitset here.
