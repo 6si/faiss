@@ -113,6 +113,8 @@ void GpuIndexHNSW::reset() {
     deviceIndex_.reset();
     this->ntotal = 0;
     this->is_trained = false;
+    is_cosine_ = false;
+    use_ip_ = false;
 }
 
 void GpuIndexHNSW::setSearchParams(const GpuHnswSearchParams& params) const {
