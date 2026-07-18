@@ -103,6 +103,7 @@ set(FAISS_GPU_HEADERS
   GpuIndicesOptions.h
   GpuResources.h
   StandardGpuResources.h
+  impl/GpuHnswBruteForce.cuh
   impl/GpuHnswBuild.cuh
   impl/GpuHnswSearch.cuh
   impl/GpuHnswSearchKernel.cuh

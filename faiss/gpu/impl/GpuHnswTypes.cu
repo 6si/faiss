@@ -99,6 +99,30 @@ void GpuHnswSearchScratch::ensure(
     }
 }
 
+void GpuHnswSearchScratch::ensure_filter(int nq, size_t bitset_bytes_needed) {
+    // Device bitset: reallocate when the segment row count (hence the byte
+    // count) grows. ensure() is called per search with the current n_rows, so
+    // a segment that gains rows via reload re-sizes the bitset here.
+    if (bitset_bytes_needed > bitset_bytes) {
+        if (d_bitset)
+            cudaFree(d_bitset);
+        SCRATCH_CUDA_CHECK(cudaMalloc(&d_bitset, bitset_bytes_needed));
+        bitset_bytes = bitset_bytes_needed;
+    }
+    // needs_bf worklist: one uint32 query index per query, plus a single
+    // atomic counter. Sized to nq (grow-only).
+    if (nq > needs_bf_cap) {
+        if (d_needs_bf)
+            cudaFree(d_needs_bf);
+        SCRATCH_CUDA_CHECK(cudaMalloc(
+                &d_needs_bf, static_cast<size_t>(nq) * sizeof(uint32_t)));
+        needs_bf_cap = nq;
+    }
+    if (d_needs_bf_count == nullptr) {
+        SCRATCH_CUDA_CHECK(cudaMalloc(&d_needs_bf_count, sizeof(int)));
+    }
+}
+
 GpuHnswSearchScratch::~GpuHnswSearchScratch() {
     // Set the owning device before freeing so cudaFree runs in the correct
     // context on multi-GPU systems.
@@ -115,6 +139,12 @@ GpuHnswSearchScratch::~GpuHnswSearchScratch() {
         cudaFree(d_visited_bitmaps);
     if (d_queries_i8)
         cudaFree(d_queries_i8);
+    if (d_bitset)
+        cudaFree(d_bitset);
+    if (d_needs_bf)
+        cudaFree(d_needs_bf);
+    if (d_needs_bf_count)
+        cudaFree(d_needs_bf_count);
 }
 
 GpuHnswScratchSlot::~GpuHnswScratchSlot() {
