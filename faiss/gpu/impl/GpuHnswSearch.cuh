@@ -225,6 +225,13 @@ inline void gpu_hnsw_search(
             if (block_size < max_staging) {
                 block_size = max_staging;
             }
+            // The layer-0 expansion is warp-cooperative (one warp per candidate
+            // edge, 32 lanes striding the vector for coalesced loads), so the
+            // block must be a whole number of warps for the full-mask __shfl
+            // reductions to be well-defined. The default (128) and the
+            // power-of-two staging bump are already multiples of 32; this only
+            // rounds up a caller-supplied non-multiple thread_block_size.
+            block_size = ((block_size + 31) / 32) * 32;
             if (block_size > 1024) {
                 throw std::runtime_error(
                         std::string("gpu_hnsw: padded staging capacity ") +

@@ -145,6 +145,75 @@ __device__ __forceinline__ float layer0_distance(
     }
 }
 
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, off);
+    return v;
+}
+
+__device__ __forceinline__ int warp_reduce_sum(int v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, off);
+    return v;
+}
+
+// Warp-cooperative layer-0 distance. The 32 lanes stride the vector (lane d
+// reads elements d, d+32, ...), so the dataset loads coalesce into 1
+// sector/request instead of the ~12 the thread-per-candidate path produced
+// (see the perf analysis: uncoalesced loads were 49% of warp stalls / DRAM at
+// 38% of peak). The per-lane partial sums are warp-reduced; the returned
+// distance is valid on lane 0 only (the reduction accumulates there), so
+// callers that need it on other lanes must broadcast. Same convention as
+// layer0_distance() (smaller == closer, IP negated, COSINE scaled by inv_norm).
+template <typename DataT, typename QueryT, bool USE_DP4A>
+__device__ __forceinline__ float layer0_distance_warp(
+        const QueryT* __restrict__ query,
+        const DataT* __restrict__ d_dataset,
+        const float* __restrict__ d_inv_norms,
+        uint32_t id,
+        int dim,
+        int dim4,
+        bool use_inner_product,
+        int lane) {
+    if constexpr (USE_DP4A) {
+        const int32_t* vec_packed = reinterpret_cast<const int32_t*>(
+                d_dataset + static_cast<int64_t>(id) * dim);
+        const int32_t* query_packed =
+                reinterpret_cast<const int32_t*>(query);
+        int sum = 0;
+        for (int d = lane; d < dim4; d += 32) {
+            sum = __dp4a(query_packed[d], vec_packed[d], sum);
+        }
+        sum = warp_reduce_sum(sum);
+        float dist = static_cast<float>(-sum);
+        if (d_inv_norms)
+            dist *= __ldg(&d_inv_norms[id]);
+        return dist;
+    } else {
+        const DataT* vec = d_dataset + static_cast<int64_t>(id) * dim;
+        if (use_inner_product) {
+            float sum = 0.0f;
+            for (int d = lane; d < dim; d += 32) {
+                sum += query[d] * load_elem(vec, d);
+            }
+            sum = warp_reduce_sum(sum);
+            float dist = -sum;
+            if (d_inv_norms)
+                dist *= __ldg(&d_inv_norms[id]);
+            return dist;
+        } else {
+            float sum = 0.0f;
+            for (int d = lane; d < dim; d += 32) {
+                float diff = query[d] - load_elem(vec, d);
+                sum += diff * diff;
+            }
+            return warp_reduce_sum(sum);
+        }
+    }
+}
+
 // ============================================================================
 // Phase 1: Upper-layer greedy search
 // ============================================================================
@@ -639,6 +708,15 @@ __global__ void layer0_beam_search_kernel(
     const QueryT* query = d_queries + static_cast<int64_t>(query_idx) * dim;
     int dim4 = dim / 4;
 
+    // Warp-cooperative neighbor expansion: one warp owns one candidate edge and
+    // its 32 lanes compute the distance together (coalesced loads). The host
+    // rounds block_size up to a whole number of warps so every lane below is
+    // part of a full 32-lane warp (required for the full-mask __shfl reductions
+    // in layer0_distance_warp).
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int num_warps = blockDim.x >> 5;
+
     extern __shared__ char smem[];
 
     // Pad to a power of two so the bitonic sort in parallel_merge_into_result
@@ -737,22 +815,37 @@ __global__ void layer0_beam_search_kernel(
         meta[1] = 0;
     __syncthreads();
 
-    for (int j = threadIdx.x; ep_valid && j < max_degree0; j += blockDim.x) {
-        uint32_t nbr =
-                d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j];
-        if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
+    for (int j = warp_in_block; ep_valid && j < max_degree0; j += num_warps) {
+        // Lane 0 resolves the neighbor and claims the first-visit; the go/no-go
+        // and id are broadcast so the whole warp stays convergent for the
+        // cooperative distance below. `proceed` is warp-uniform, so the
+        // `continue` never splits the warp (no __shfl hazard).
+        uint32_t nbr = UINT32_MAX;
+        bool proceed = false;
+        if (lane == 0) {
+            uint32_t cand =
+                    d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j];
+            if (cand != UINT32_MAX && cand < static_cast<uint32_t>(N) &&
+                bitmap_visit(visited_bmap, cand)) {
+                nbr = cand;
+                proceed = true;
+            }
+        }
+        proceed = __shfl_sync(0xffffffff, proceed, 0);
+        if (!proceed)
             continue;
-        if (!bitmap_visit(visited_bmap, nbr))
-            continue;
+        nbr = __shfl_sync(0xffffffff, nbr, 0);
 
-        float dist = layer0_distance<DataT, QueryT, USE_DP4A>(
+        float dist = layer0_distance_warp<DataT, QueryT, USE_DP4A>(
                 query, d_dataset, d_inv_norms, nbr, dim, dim4,
-                use_inner_product);
+                use_inner_product, lane);
 
-        int slot = atomicAdd(&meta[1], 1);
-        if (slot < max_staging) {
-            staging_ids[slot] = nbr;
-            staging_dists[slot] = dist;
+        if (lane == 0) {
+            int slot = atomicAdd(&meta[1], 1);
+            if (slot < max_staging) {
+                staging_ids[slot] = nbr;
+                staging_dists[slot] = dist;
+            }
         }
     }
     __syncthreads();
@@ -863,36 +956,53 @@ __global__ void layer0_beam_search_kernel(
         __syncthreads();
 
         int total_work = num_parents * max_degree0;
-        for (int wi = threadIdx.x; wi < total_work; wi += blockDim.x) {
+        for (int wi = warp_in_block; wi < total_work; wi += num_warps) {
             int parent_idx = wi / max_degree0;
             int nbr_slot = wi % max_degree0;
 
             uint32_t parent = parent_ids[parent_idx];
-            // Defensive: a parent id must be a real node (< N). result_ids only
-            // ever holds the entry point or graph neighbors (both < N) once the
-            // merge is correct, so this never fires on the healthy path; it caps
-            // a stray/garbage id at O(N) instead of letting it index the graph
-            // at parent*max_degree0 and fault far out of bounds. Mirrors the
-            // neighbor guard below.
-            if (parent >= static_cast<uint32_t>(N))
-                continue;
-            uint32_t nbr =
-                    d_layer0_graph
-                                  [static_cast<int64_t>(parent) * max_degree0 +
-                                   nbr_slot];
-            if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
-                continue;
-            if (!bitmap_visit(visited_bmap, nbr))
-                continue;
 
-            float dist = layer0_distance<DataT, QueryT, USE_DP4A>(
+            // Lane 0 resolves the neighbor id, bounds-checks it, and claims the
+            // first-visit; the go/no-go and id are broadcast so the warp stays
+            // convergent for the cooperative distance. All predicates below are
+            // warp-uniform (`parent` is identical across lanes), so the
+            // `continue` never splits the warp and the __shfl calls in
+            // layer0_distance_warp always see a full 32-lane mask.
+            uint32_t nbr = UINT32_MAX;
+            bool proceed = false;
+            if (lane == 0) {
+                // Defensive: a parent id must be a real node (< N). result_ids
+                // only ever holds the entry point or graph neighbors (both < N)
+                // once the merge is correct, so this never fires on the healthy
+                // path; it caps a stray/garbage id at O(N) instead of letting it
+                // index the graph at parent*max_degree0 and fault far out of
+                // bounds. Mirrors the neighbor guard below.
+                if (parent < static_cast<uint32_t>(N)) {
+                    uint32_t cand = d_layer0_graph
+                            [static_cast<int64_t>(parent) * max_degree0 +
+                             nbr_slot];
+                    if (cand != UINT32_MAX && cand < static_cast<uint32_t>(N) &&
+                        bitmap_visit(visited_bmap, cand)) {
+                        nbr = cand;
+                        proceed = true;
+                    }
+                }
+            }
+            proceed = __shfl_sync(0xffffffff, proceed, 0);
+            if (!proceed)
+                continue;
+            nbr = __shfl_sync(0xffffffff, nbr, 0);
+
+            float dist = layer0_distance_warp<DataT, QueryT, USE_DP4A>(
                     query, d_dataset, d_inv_norms, nbr, dim, dim4,
-                    use_inner_product);
+                    use_inner_product, lane);
 
-            int slot = atomicAdd(&meta[1], 1);
-            if (slot < max_staging) {
-                staging_ids[slot] = nbr;
-                staging_dists[slot] = dist;
+            if (lane == 0) {
+                int slot = atomicAdd(&meta[1], 1);
+                if (slot < max_staging) {
+                    staging_ids[slot] = nbr;
+                    staging_dists[slot] = dist;
+                }
             }
         }
         __syncthreads();
