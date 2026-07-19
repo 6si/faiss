@@ -34,8 +34,9 @@
 #include <string>
 #include <vector>
 
-#include <faiss/gpu/impl/GpuHnswSearchKernel.cuh>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
+#include <faiss/gpu/impl/GpuHnswBruteForce.cuh>
+#include <faiss/gpu/impl/GpuHnswSearchKernel.cuh>
 
 #define GPU_HNSW_CUDA_CHECK(expr)                                     \
     do {                                                              \
@@ -85,6 +86,37 @@ inline void gpu_hnsw_search(
     int dim = static_cast<int>(idx.dim);
     int num_upper_layers = idx.num_upper_layers_built;
 
+    // --- Filtered-search setup (deletes / TTL / partition bitset) ---
+    // The bitset bytes are uploaded into sc.d_bitset by the caller (searchHost/
+    // searchHostInt8) on this same stream before gpu_hnsw_search runs. When
+    // bitset_data is null we take the unfiltered fast path.
+    bool has_filter = (params.bitset_data != nullptr);
+    int64_t nbits = params.bitset_nbits;
+    int64_t filtered_count = params.bitset_filtered_count;
+    int64_t live_count = has_filter ? (nbits - filtered_count)
+                                    : static_cast<int64_t>(idx.n_rows);
+    if (live_count < 0) {
+        live_count = 0;
+    }
+    // kAlpha rate-limits how often filtered nodes become waypoints; it scales
+    // with the delete ratio, matching CPU HNSW (kAlpha = filter_ratio * 0.7).
+    float filter_ratio = (has_filter && nbits > 0)
+            ? static_cast<float>(filtered_count) / static_cast<float>(nbits)
+            : 0.0f;
+    float kAlpha = filter_ratio * 0.7f;
+    bool disable_bf = params.disable_fallback_brute_force;
+
+    // Up-front brute force: when almost everything is filtered, or k is a large
+    // fraction of the live set, the graph walk cannot beat a full scan and
+    // risks returning fewer than k live results. Mirrors CPU HNSW's
+    // kHnswSearchKnnBFFilterThreshold (0.93) and kHnswSearchBFTopkThreshold
+    // (0.5, applied to the live count). Disabled when the caller disables the
+    // brute-force fallback.
+    bool up_front_bf = has_filter && !disable_bf && nbits > 0 &&
+            (static_cast<double>(filtered_count) >=
+                     0.93 * static_cast<double>(nbits) ||
+             static_cast<double>(k) >= 0.5 * static_cast<double>(live_count));
+
     // Layer-0 is templated on the dataset type (DataT), the layer-0 query type
     // (QueryT: float generic, int8_t for the native DP4A path) and USE_DP4A.
     // The upper-layer greedy descent always uses the fp32 queries (sc.d_queries).
@@ -92,6 +124,41 @@ inline void gpu_hnsw_search(
                                   const DataT* d_data,
                                   const float* d_inv_norms,
                                   const QueryT* d_layer0_queries) {
+        int N_int = static_cast<int>(idx.n_rows);
+
+        // Brute-force launcher (shares the current dtype specialization). The
+        // block must be a power of two <= kBruteForceMaxBlock for the tree
+        // reduction. Grid is always num_queries: the up-front path uses the
+        // identity mapping, the per-query fallback reads its worklist length
+        // from d_num on the device (no host sync between graph and BF).
+        int bf_block = 128;
+        auto launch_bf = [&](const uint32_t* worklist,
+                             const int* d_num,
+                             int num_items) {
+            hnsw_kernel::brute_force_topk_kernel<DataT, QueryT, USE_DP4A>
+                    <<<num_queries, bf_block, 0, stream>>>(
+                            d_layer0_queries,
+                            d_data,
+                            d_inv_norms,
+                            sc.d_bitset,
+                            worklist,
+                            num_items,
+                            d_num,
+                            N_int,
+                            dim,
+                            k,
+                            idx.use_ip,
+                            sc.d_neighbors,
+                            sc.d_distances);
+            GPU_HNSW_CUDA_CHECK(cudaGetLastError());
+        };
+
+        // Up-front brute force skips the graph search entirely.
+        if (up_front_bf) {
+            launch_bf(nullptr, nullptr, num_queries);
+            return;
+        }
+
         if (num_upper_layers > 0) {
             auto* d_layer_ptrs = static_cast<hnsw_kernel::upper_layer_ptrs*>(
                     idx.d_upper_layer_ptrs);
@@ -167,10 +234,15 @@ inline void gpu_hnsw_search(
                         std::to_string(idx.max_degree0) + ")");
             }
             // Fixed overhead: staging (max_staging*8) + parent_ids (sw*4)
-            // + meta (12)
-            int smem_overhead = max_staging * 8 + sw * 4 + 12;
-            // Per-ef cost: 3 result arrays + 3 merge arrays = 6 × 4 = 24 bytes/slot
-            int max_ef = (smem_max - smem_overhead) / 24;
+            // + meta (12, or 24 on the filtered path with 6 slots).
+            int meta_bytes = has_filter ? 24 : 12;
+            int smem_overhead = max_staging * 8 + sw * 4 + meta_bytes;
+            // Per-ef cost: 3 result arrays + 3 merge arrays = 6 × 4 = 24
+            // bytes/slot. The filtered path adds the invalid frontier (3 more
+            // arrays); with ef_inv capped at ef (the default) that is a further
+            // 12 bytes/slot, so divide by 36 to bound ef conservatively.
+            int per_ef = has_filter ? 36 : 24;
+            int max_ef = (smem_max - smem_overhead) / per_ef;
             if (max_ef < 1) {
                 throw std::runtime_error(
                         std::string("gpu_hnsw: search_width=") +
@@ -202,8 +274,17 @@ inline void gpu_hnsw_search(
             }
         }
 
+        // Invalid-frontier capacity: default to the (now finalized) ef, but
+        // allow the caller to cap it smaller to save shared memory. Capped at
+        // ef so the /36 clamp above stays conservative. Only used on the
+        // filtered path.
+        int ef_inv = 0;
+        if (has_filter) {
+            ef_inv = (params.ef_inv > 0) ? std::min(params.ef_inv, ef) : ef;
+        }
+
         size_t smem_size = hnsw_kernel::calc_layer0_smem_size(
-                ef, sw, idx.max_degree0);
+                ef, sw, idx.max_degree0, has_filter ? ef_inv : 0);
 
         // Opt into >48 KiB dynamic shared memory when the device supports it;
         // without this the kernel launch would fail for large ef. This is
@@ -221,47 +302,95 @@ inline void gpu_hnsw_search(
         // the set (thinks it's configured) and fails to launch. Under the lock
         // the attribute only ever grows, and is always >= the current launch's
         // requirement before we proceed.
-        if (smem_size > 49152) {
-            static std::mutex configured_smem_mutex;
-            static size_t configured_smem = 0;
-            std::lock_guard<std::mutex> lock(configured_smem_mutex);
-            if (smem_size > configured_smem) {
-                GPU_HNSW_CUDA_CHECK(cudaFuncSetAttribute(
-                        hnsw_kernel::layer0_beam_search_kernel<
-                                DataT, QueryT, USE_DP4A>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        static_cast<int>(smem_size)));
-                configured_smem = smem_size;
-            }
-        }
-
-        int N_int = static_cast<int>(idx.n_rows);
         size_t bitmap_bytes = hnsw_kernel::calc_visited_bitmap_size(
                 num_queries, N_int);
 
         GPU_HNSW_CUDA_CHECK(
                 cudaMemsetAsync(sc.d_visited_bitmaps, 0, bitmap_bytes, stream));
 
-        hnsw_kernel::layer0_beam_search_kernel<DataT, QueryT, USE_DP4A>
-                <<<num_queries, block_size, smem_size, stream>>>(
-                        d_layer0_queries,
-                        d_data,
-                        d_inv_norms,
-                        idx.d_layer0_graph,
-                        sc.d_entry_points,
-                        sc.d_visited_bitmaps,
-                        sc.d_neighbors,
-                        sc.d_distances,
-                        num_queries,
-                        N_int,
-                        dim,
-                        idx.max_degree0,
-                        k,
-                        ef,
-                        sw,
-                        max_iter,
-                        idx.use_ip);
-        GPU_HNSW_CUDA_CHECK(cudaGetLastError());
+        // The graph kernel is templated on HAS_FILTER; the filtered and
+        // unfiltered instantiations are distinct __global__ functions, so each
+        // needs its own cudaFuncSetAttribute high-water tracking. run_graph is
+        // a nested generic lambda so its statics are per-<...,HAS_FILTER>.
+        auto run_graph = [&]<bool HAS_FILTER>() {
+            if (smem_size > 49152) {
+                static std::mutex configured_smem_mutex;
+                static size_t configured_smem = 0;
+                std::lock_guard<std::mutex> lock(configured_smem_mutex);
+                if (smem_size > configured_smem) {
+                    GPU_HNSW_CUDA_CHECK(cudaFuncSetAttribute(
+                            hnsw_kernel::layer0_beam_search_kernel<
+                                    DataT,
+                                    QueryT,
+                                    USE_DP4A,
+                                    HAS_FILTER>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            static_cast<int>(smem_size)));
+                    configured_smem = smem_size;
+                }
+            }
+
+            // Zero the per-query BF worklist counter before the graph launch
+            // (same stream, so ordered ahead of the kernel that appends to it).
+            if constexpr (HAS_FILTER) {
+                if (!disable_bf) {
+                    GPU_HNSW_CUDA_CHECK(cudaMemsetAsync(
+                            sc.d_needs_bf_count, 0, sizeof(int), stream));
+                }
+            }
+
+            const uint8_t* d_bitset = HAS_FILTER ? sc.d_bitset : nullptr;
+            uint32_t* d_needs_bf = HAS_FILTER ? sc.d_needs_bf : nullptr;
+            int* d_needs_bf_count = HAS_FILTER ? sc.d_needs_bf_count : nullptr;
+
+            hnsw_kernel::layer0_beam_search_kernel<
+                    DataT,
+                    QueryT,
+                    USE_DP4A,
+                    HAS_FILTER><<<num_queries, block_size, smem_size, stream>>>(
+                    d_layer0_queries,
+                    d_data,
+                    d_inv_norms,
+                    idx.d_layer0_graph,
+                    sc.d_entry_points,
+                    sc.d_visited_bitmaps,
+                    sc.d_neighbors,
+                    sc.d_distances,
+                    num_queries,
+                    N_int,
+                    dim,
+                    idx.max_degree0,
+                    k,
+                    ef,
+                    sw,
+                    max_iter,
+                    idx.use_ip,
+                    d_bitset,
+                    ef_inv,
+                    kAlpha,
+                    static_cast<int>(live_count),
+                    disable_bf,
+                    d_needs_bf,
+                    d_needs_bf_count);
+            GPU_HNSW_CUDA_CHECK(cudaGetLastError());
+
+            // Per-query brute-force fallback: queries whose graph search fell
+            // short (fewer than k live results) were appended to sc.d_needs_bf
+            // by the graph kernel. Launch a full-width grid; each block reads
+            // the device worklist length and early-exits when out of range, so
+            // no host sync is needed between the two kernels.
+            if constexpr (HAS_FILTER) {
+                if (!disable_bf) {
+                    launch_bf(sc.d_needs_bf, sc.d_needs_bf_count, num_queries);
+                }
+            }
+        };
+
+        if (has_filter) {
+            run_graph.template operator()<true>();
+        } else {
+            run_graph.template operator()<false>();
+        }
     };
 
     switch (idx.dataset_type) {

@@ -442,10 +442,168 @@ __device__ __forceinline__ bool bitmap_visit(
     return (old & bit) == 0;
 }
 
+// True if row `id` is filtered OUT (deleted / not visible). Matches Knowhere's
+// BitsetView byte/bit order: byte id/8, bit id%8, LSB-first. A null bitset (the
+// unfiltered fast path) is never consulted — callers gate on HAS_FILTER.
+__device__ __forceinline__ bool is_bitset_filtered(
+        const uint8_t* __restrict__ bitset,
+        uint32_t id) {
+    return (bitset[id >> 3] >> (id & 7)) & 1u;
+}
+
+// Serial insert of (id, dist) into a distance-ascending beam of current size
+// *count and capacity cap. Evicts the worst (last) element when full and the
+// new distance is better; sets expanded[pos]=0 for the freshly inserted node
+// and shifts existing expanded flags with their elements so an already-expanded
+// node keeps its flag. MUST be called from a single thread (thread 0) — it is
+// the serialized post-sort section that mirrors CPU NeighborSetPopList::insert
+// (the sequential encounter order the alpha gate depends on). Returns true if
+// the node was inserted.
+__device__ __forceinline__ bool beam_insert_serial(
+        uint32_t* ids,
+        float* dists,
+        uint32_t* expanded,
+        int* count,
+        int cap,
+        uint32_t id,
+        float dist) {
+    int c = *count;
+    if (c >= cap && !(dist < dists[cap - 1])) {
+        return false; // full and not better than the current worst
+    }
+    // Number of elements retained ahead of the insert: drop the worst if full.
+    int n = (c < cap) ? c : cap - 1;
+    int p = n;
+    while (p > 0 && dists[p - 1] > dist) {
+        p--;
+    }
+    for (int i = n; i > p; i--) {
+        ids[i] = ids[i - 1];
+        dists[i] = dists[i - 1];
+        expanded[i] = expanded[i - 1];
+    }
+    ids[p] = id;
+    dists[p] = dist;
+    expanded[p] = 0;
+    *count = (c < cap) ? (c + 1) : cap;
+    return true;
+}
+
+// Two-tier merge for the filtered path (thread 0 only). Walks the already
+// bitonic-sorted staging candidates in ascending-distance order and routes
+// each one:
+//   - not filtered  -> result beam (valid results, ef capacity)
+//   - filtered      -> alpha gate; if it fires, admit to the invalid frontier
+//                      only while closer than the valid beam's worst
+//                      (at_search_back_dist: FLT_MAX until the valid beam is
+//                      full, else result_dists[ef-1]).
+// The alpha gate (accumulated_alpha, carried per query in meta[4]) rate-limits
+// how often filtered nodes become waypoints, matching CPU
+// NeighborSetDoublePopList. Deterministic and rate-limiting, but not
+// bit-identical to CPU graph-neighbor encounter order — parity is asserted by
+// the recall gate, not identical traversal.
+__device__ __forceinline__ void filtered_merge_serial(
+        uint32_t* result_ids,
+        float* result_dists,
+        uint32_t* is_expanded,
+        uint32_t* invalid_ids,
+        float* invalid_dists,
+        uint32_t* invalid_exp,
+        uint32_t* staging_ids,
+        float* staging_dists,
+        int* meta,
+        const uint8_t* __restrict__ bitset,
+        int ef,
+        int ef_inv,
+        int max_staging,
+        float kAlpha) {
+    int sc = min(meta[1], max_staging);
+    int rc = meta[0];
+    int ic = meta[3];
+    float* alpha_ptr = reinterpret_cast<float*>(&meta[4]);
+    float accumulated_alpha = *alpha_ptr;
+
+    for (int i = 0; i < sc; i++) {
+        uint32_t id = staging_ids[i];
+        if (id == UINT32_MAX)
+            continue;
+        float d = staging_dists[i];
+        if (!is_bitset_filtered(bitset, id)) {
+            beam_insert_serial(
+                    result_ids, result_dists, is_expanded, &rc, ef, id, d);
+        } else {
+            accumulated_alpha += kAlpha;
+            if (accumulated_alpha < 1.0f)
+                continue;
+            accumulated_alpha -= 1.0f;
+            float valid_worst = (rc >= ef) ? result_dists[ef - 1] : FLT_MAX;
+            if (d < valid_worst) {
+                beam_insert_serial(
+                        invalid_ids,
+                        invalid_dists,
+                        invalid_exp,
+                        &ic,
+                        ef_inv,
+                        id,
+                        d);
+            }
+        }
+    }
+    meta[0] = rc;
+    meta[3] = ic;
+    *alpha_ptr = accumulated_alpha;
+}
+
+// Cross-beam parent selection for the filtered path (thread 0 only). Repeatedly
+// takes the globally-closest UNEXPANDED node across the valid result beam and
+// the invalid frontier (both distance-ascending), up to search_width parents.
+// This is the GPU analog of CPU NeighborSetDoublePopList::pop_based_on_distance
+// + has_next: an invalid node is only eligible while it is closer than the
+// valid beam's worst (FLT_MAX until the valid beam fills). Returns the number
+// of parents chosen; 0 means the search has converged. Filtered parents are
+// expanded as waypoints but never enter the top-k (they live only in the
+// invalid frontier).
+__device__ __forceinline__ int select_parents_cross_beam(
+        uint32_t* result_ids,
+        float* result_dists,
+        uint32_t* is_expanded,
+        int rc,
+        uint32_t* invalid_ids,
+        float* invalid_dists,
+        uint32_t* invalid_exp,
+        int ic,
+        uint32_t* parent_ids,
+        int ef,
+        int search_width) {
+    int num_parents = 0;
+    float valid_worst = (rc >= ef) ? result_dists[ef - 1] : FLT_MAX;
+    int ri = 0, ii = 0;
+    while (num_parents < search_width) {
+        while (ri < rc && is_expanded[ri])
+            ri++;
+        while (ii < ic && invalid_exp[ii])
+            ii++;
+        bool hasR = (ri < rc);
+        bool hasI = (ii < ic) && (invalid_dists[ii] < valid_worst);
+        if (!hasR && !hasI)
+            break;
+        if (hasR && (!hasI || result_dists[ri] <= invalid_dists[ii])) {
+            parent_ids[num_parents++] = result_ids[ri];
+            is_expanded[ri] = 1;
+            ri++;
+        } else {
+            parent_ids[num_parents++] = invalid_ids[ii];
+            invalid_exp[ii] = 1;
+            ii++;
+        }
+    }
+    return num_parents;
+}
+
 // Templated on the dataset element type (DataT), the query element type
 // (QueryT: float for the generic path, int8_t for the native DP4A path), and
 // USE_DP4A which selects the DP4A int8 inner-product distance at compile time.
-template <typename DataT, typename QueryT, bool USE_DP4A>
+template <typename DataT, typename QueryT, bool USE_DP4A, bool HAS_FILTER>
 __global__ void layer0_beam_search_kernel(
         const QueryT* __restrict__ d_queries,
         const DataT* __restrict__ d_dataset,
@@ -463,7 +621,17 @@ __global__ void layer0_beam_search_kernel(
         int ef,
         int search_width,
         int max_iterations,
-        bool use_inner_product) {
+        bool use_inner_product,
+        // --- Filtered-search args (ignored when HAS_FILTER is false; the
+        // branches are compiled out via `if constexpr` so the unfiltered
+        // instantiation is codegen-identical to the append-only kernel). ---
+        const uint8_t* __restrict__ d_bitset,
+        int ef_inv,
+        float kAlpha,
+        int live_count,
+        bool disable_bf,
+        uint32_t* __restrict__ d_needs_bf,
+        int* __restrict__ d_needs_bf_count) {
     int query_idx = blockIdx.x;
     if (query_idx >= num_queries)
         return;
@@ -477,6 +645,11 @@ __global__ void layer0_beam_search_kernel(
     // has a valid capacity for any max_degree0 (e.g. non-power-of-two 2*M).
     int max_staging = padded_staging_capacity(search_width, max_degree0);
 
+    // The filtered path carries 3 extra meta slots (invalid count + alpha +
+    // spare) and appends an ef_inv-sized invalid frontier after the merge
+    // scratch. The unfiltered path keeps exactly today's layout.
+    constexpr int kMetaSlots = HAS_FILTER ? 6 : 3;
+
     uint32_t* result_ids = reinterpret_cast<uint32_t*>(smem);
     float* result_dists = reinterpret_cast<float*>(result_ids + ef);
     uint32_t* is_expanded = reinterpret_cast<uint32_t*>(result_dists + ef);
@@ -485,9 +658,15 @@ __global__ void layer0_beam_search_kernel(
     uint32_t* parent_ids =
             reinterpret_cast<uint32_t*>(staging_dists + max_staging);
     int* meta = reinterpret_cast<int*>(parent_ids + search_width);
-    uint32_t* merged_ids = reinterpret_cast<uint32_t*>(meta + 3);
+    uint32_t* merged_ids = reinterpret_cast<uint32_t*>(meta + kMetaSlots);
     float* merged_dists = reinterpret_cast<float*>(merged_ids + ef);
     uint32_t* merged_expanded = reinterpret_cast<uint32_t*>(merged_dists + ef);
+    // Invalid frontier (filtered path only): filtered nodes retained as
+    // waypoints. Never emitted; expanded when they are the globally-closest
+    // unexpanded node.
+    uint32_t* invalid_ids = merged_expanded + ef;
+    float* invalid_dists = reinterpret_cast<float*>(invalid_ids + ef_inv);
+    uint32_t* invalid_exp = reinterpret_cast<uint32_t*>(invalid_dists + ef_inv);
 
     int bitmap_words = (N + 31) / 32;
     uint32_t* visited_bmap =
@@ -502,6 +681,13 @@ __global__ void layer0_beam_search_kernel(
         meta[0] = 0;
         meta[1] = 0;
         meta[2] = 0;
+        if constexpr (HAS_FILTER) {
+            meta[3] = 0; // invalid frontier count
+            // accumulated_alpha, carried per query in meta[4], init 1.0f to
+            // match CPU NeighborSetDoublePopList (first filtered node always
+            // admitted once the gate accumulates).
+            *reinterpret_cast<float*>(&meta[4]) = 1.0f;
+        }
     }
     __syncthreads();
 
@@ -517,10 +703,28 @@ __global__ void layer0_beam_search_kernel(
             float ep_dist = layer0_distance<DataT, QueryT, USE_DP4A>(
                     query, d_dataset, d_inv_norms, ep, dim, dim4,
                     use_inner_product);
-            result_ids[0] = ep;
-            result_dists[0] = ep_dist;
-            is_expanded[0] = 0;
-            meta[0] = 1;
+            if constexpr (HAS_FILTER) {
+                // A filtered entry point is a waypoint only: seed it into the
+                // invalid frontier so it is never emitted but can still be
+                // expanded. Otherwise seed the valid result beam as usual.
+                if (is_bitset_filtered(d_bitset, ep)) {
+                    invalid_ids[0] = ep;
+                    invalid_dists[0] = ep_dist;
+                    invalid_exp[0] = 0;
+                    meta[3] = 1;
+                    meta[0] = 0;
+                } else {
+                    result_ids[0] = ep;
+                    result_dists[0] = ep_dist;
+                    is_expanded[0] = 0;
+                    meta[0] = 1;
+                }
+            } else {
+                result_ids[0] = ep;
+                result_dists[0] = ep_dist;
+                is_expanded[0] = 0;
+                meta[0] = 1;
+            }
             bitmap_visit(visited_bmap, ep);
         } else {
             meta[0] = 0;
@@ -553,17 +757,66 @@ __global__ void layer0_beam_search_kernel(
     }
     __syncthreads();
 
-    parallel_merge_into_result(
-            result_ids, result_dists, is_expanded,
-            staging_ids, staging_dists,
-            merged_ids, merged_dists, merged_expanded,
-            meta, ef, max_staging);
+    if constexpr (HAS_FILTER) {
+        bitonic_sort_staging(
+                staging_ids,
+                staging_dists,
+                min(meta[1], max_staging),
+                max_staging);
+        if (threadIdx.x == 0) {
+            filtered_merge_serial(
+                    result_ids,
+                    result_dists,
+                    is_expanded,
+                    invalid_ids,
+                    invalid_dists,
+                    invalid_exp,
+                    staging_ids,
+                    staging_dists,
+                    meta,
+                    d_bitset,
+                    ef,
+                    ef_inv,
+                    max_staging,
+                    kAlpha);
+        }
+    } else {
+        parallel_merge_into_result(
+                result_ids,
+                result_dists,
+                is_expanded,
+                staging_ids,
+                staging_dists,
+                merged_ids,
+                merged_dists,
+                merged_expanded,
+                meta,
+                ef,
+                max_staging);
+    }
+    __syncthreads();
+    // Mark the entry point expanded (its neighbors were already seeded above).
+    // It lives in the valid beam, or in the invalid frontier if it was
+    // filtered.
     if (threadIdx.x == 0) {
         int rc = meta[0];
+        bool found = false;
         for (int i = 0; i < rc; i++) {
             if (result_ids[i] == ep) {
                 is_expanded[i] = 1;
+                found = true;
                 break;
+            }
+        }
+        if constexpr (HAS_FILTER) {
+            if (!found) {
+                int ic = meta[3];
+                for (int i = 0; i < ic; i++) {
+                    if (invalid_ids[i] == ep) {
+                        invalid_exp[i] = 1;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -575,10 +828,25 @@ __global__ void layer0_beam_search_kernel(
             int num_parents = 0;
             int rc = meta[0];
 
-            for (int i = 0; i < rc && num_parents < search_width; i++) {
-                if (!is_expanded[i]) {
-                    parent_ids[num_parents++] = result_ids[i];
-                    is_expanded[i] = 1;
+            if constexpr (HAS_FILTER) {
+                num_parents = select_parents_cross_beam(
+                        result_ids,
+                        result_dists,
+                        is_expanded,
+                        rc,
+                        invalid_ids,
+                        invalid_dists,
+                        invalid_exp,
+                        meta[3],
+                        parent_ids,
+                        ef,
+                        search_width);
+            } else {
+                for (int i = 0; i < rc && num_parents < search_width; i++) {
+                    if (!is_expanded[i]) {
+                        parent_ids[num_parents++] = result_ids[i];
+                        is_expanded[i] = 1;
+                    }
                 }
             }
 
@@ -629,11 +897,44 @@ __global__ void layer0_beam_search_kernel(
         }
         __syncthreads();
 
-        parallel_merge_into_result(
-                result_ids, result_dists, is_expanded,
-                staging_ids, staging_dists,
-                merged_ids, merged_dists, merged_expanded,
-                meta, ef, max_staging);
+        if constexpr (HAS_FILTER) {
+            bitonic_sort_staging(
+                    staging_ids,
+                    staging_dists,
+                    min(meta[1], max_staging),
+                    max_staging);
+            if (threadIdx.x == 0) {
+                filtered_merge_serial(
+                        result_ids,
+                        result_dists,
+                        is_expanded,
+                        invalid_ids,
+                        invalid_dists,
+                        invalid_exp,
+                        staging_ids,
+                        staging_dists,
+                        meta,
+                        d_bitset,
+                        ef,
+                        ef_inv,
+                        max_staging,
+                        kAlpha);
+            }
+            __syncthreads();
+        } else {
+            parallel_merge_into_result(
+                    result_ids,
+                    result_dists,
+                    is_expanded,
+                    staging_ids,
+                    staging_dists,
+                    merged_ids,
+                    merged_dists,
+                    merged_expanded,
+                    meta,
+                    ef,
+                    max_staging);
+        }
 
         // Stagnation detected when num_parents==0 (all expanded) → break above
     }
@@ -660,11 +961,39 @@ __global__ void layer0_beam_search_kernel(
                     use_inner_product ? -FLT_MAX : FLT_MAX;
         }
     }
+
+    // --- Per-query brute-force fallback (filtered path) ---
+    // If the filtered graph search returned fewer than k valid results while
+    // more than that many live rows exist, this query short-fell (its near
+    // neighbors were filtered out). Append it to the device worklist for a
+    // batched BF pass, matching CPU HNSW's per-query fallback. Skipped when
+    // disable_bf mirrors hnsw_cfg.disable_fallback_brute_force (short queries
+    // then keep their padded sentinels).
+    if constexpr (HAS_FILTER) {
+        if (threadIdx.x == 0 && !disable_bf) {
+            int rc = meta[0];
+            int real_topk = min(rc, k);
+            if (real_topk < k && real_topk < live_count) {
+                int pos = atomicAdd(d_needs_bf_count, 1);
+                d_needs_bf[pos] = static_cast<uint32_t>(query_idx);
+            }
+        }
+    }
 }
 
-inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0) {
+inline size_t calc_layer0_smem_size(
+        int ef,
+        int search_width,
+        int max_degree0,
+        int ef_inv = 0) {
     // Must match the kernel's padded staging capacity exactly.
     int max_staging = padded_staging_capacity(search_width, max_degree0);
+
+    // ef_inv > 0 selects the filtered layout: 3 extra meta slots and an
+    // ef_inv-sized invalid frontier (12 B / ef_inv). ef_inv == 0 is the
+    // unfiltered layout, byte-identical to the append-only kernel.
+    bool has_filter = (ef_inv > 0);
+    int meta_slots = has_filter ? 6 : 3;
 
     size_t size = 0;
     size += ef * sizeof(uint32_t);           // result_ids
@@ -673,10 +1002,15 @@ inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0) {
     size += max_staging * sizeof(uint32_t);  // staging_ids
     size += max_staging * sizeof(float);     // staging_dists
     size += search_width * sizeof(uint32_t); // parent_ids
-    size += 3 * sizeof(int);                 // meta
+    size += meta_slots * sizeof(int);        // meta
     size += ef * sizeof(uint32_t);           // merged_ids
     size += ef * sizeof(float);              // merged_dists
     size += ef * sizeof(uint32_t);           // merged_expanded
+    if (has_filter) {
+        size += ef_inv * sizeof(uint32_t); // invalid_ids
+        size += ef_inv * sizeof(float);    // invalid_dists
+        size += ef_inv * sizeof(uint32_t); // invalid_exp
+    }
     return size;
 }
 

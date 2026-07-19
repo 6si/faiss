@@ -81,6 +81,31 @@ struct GpuHnswSearchParams {
     int search_width = 4;
     int max_iterations = 0;
     int thread_block_size = 0;
+
+    // --- Filtered search (deletes / TTL / partition / visibility bitset) ---
+    //
+    // When bitset_data == nullptr the search runs the unfiltered fast path,
+    // which is codegen-identical to the append-only kernel (the filter
+    // branches are compiled out via `if constexpr`). When non-null it enables
+    // CPU-HNSW-parity filtered search: filtered nodes stay graph waypoints but
+    // are never emitted, an alpha gate rate-limits their expansion, and a
+    // brute-force fallback guarantees k live results under heavy deletes.
+    //
+    // Semantics match Knowhere's BitsetView: a set bit means the row at that
+    // index is filtered OUT (deleted / not visible). The bit order is
+    // LSB-first per byte: row r is byte r/8, bit r%8. The index space is the
+    // storage add-order row id, which the GPU returns directly (see the design
+    // doc's ID-mapping section and the gpu_hnsw_id_mapping test).
+    const uint8_t* bitset_data = nullptr; // host ptr, uploaded per search batch
+    int64_t bitset_nbits = 0;             // rows the bitset covers (== n_rows)
+    int64_t bitset_filtered_count = 0;    // popcount: rows filtered out
+    // Invalid-frontier capacity. 0 => default to ef. Cappable to bound the
+    // extra shared memory (12 B / ef_inv on top of the 24 B / ef base).
+    int ef_inv = 0;
+    // Mirrors Knowhere's hnsw_cfg.disable_fallback_brute_force. When true the
+    // short-result BF fallback is skipped and short queries keep padded
+    // sentinels, matching CPU HNSW with fallback disabled.
+    bool disable_fallback_brute_force = false;
 };
 
 struct GpuHnswDeviceUpperLayer {
@@ -98,18 +123,36 @@ struct GpuHnswSearchScratch {
     uint32_t* d_visited_bitmaps = nullptr;
     int8_t* d_queries_i8 = nullptr; // int8 queries for the native DP4A path
 
+    // Filtered-search scratch. d_bitset holds the uploaded BitsetView bytes
+    // (ceil(nbits/8)); d_needs_bf is the device-side worklist of query indices
+    // whose graph search returned fewer than k live results (per-query BF
+    // fallback), and d_needs_bf_count is its atomic length. All allocated
+    // lazily and only when a filtered search runs.
+    uint8_t* d_bitset = nullptr;
+    uint32_t* d_needs_bf = nullptr;
+    int* d_needs_bf_count = nullptr;
+
     size_t queries_bytes = 0;
     size_t neighbors_bytes = 0;
     size_t distances_bytes = 0;
     int entry_cap = 0;
     size_t bitmap_bytes = 0;
     size_t queries_i8_bytes = 0;
+    size_t bitset_bytes = 0;
+    int needs_bf_cap = 0;
 
     // Device this scratch's allocations live on; used to set the CUDA device
     // context before freeing in the destructor (multi-GPU correctness).
     int device = 0;
 
     void ensure(int nq, int k, int dim, int N, bool use_i8_queries = false);
+
+    // Ensure the per-search filter scratch is large enough: a device bitset of
+    // `bitset_bytes_needed` bytes (reallocated when n_rows grows) and a
+    // needs_bf worklist sized for `nq` queries plus its counter. Separate from
+    // ensure() because filtering is optional and the bitset size tracks the
+    // segment row count, not nq/k/dim.
+    void ensure_filter(int nq, size_t bitset_bytes_needed);
 
     ~GpuHnswSearchScratch();
 

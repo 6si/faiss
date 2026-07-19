@@ -37,6 +37,34 @@
 namespace faiss {
 namespace gpu {
 
+namespace {
+
+// Upload the filtered-search bitset (deletes / TTL / partition) into the
+// scratch slot's device buffer on the search stream. gpu_hnsw_search reads
+// sp.bitset_data only to decide the filtered path; the bytes themselves come
+// from sc.d_bitset. The host BitsetView bytes referenced by sp.bitset_data
+// must stay alive until the stream is synchronized (the caller synchronizes
+// before returning, which happens in every search path here).
+inline void upload_bitset_if_needed(
+        GpuHnswSearchScratch& sc,
+        const GpuHnswSearchParams& sp,
+        int nq,
+        cudaStream_t stream) {
+    if (sp.bitset_data == nullptr || sp.bitset_nbits <= 0) {
+        return;
+    }
+    size_t bytes = static_cast<size_t>((sp.bitset_nbits + 7) / 8);
+    sc.ensure_filter(nq, bytes);
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            sc.d_bitset,
+            sp.bitset_data,
+            bytes,
+            cudaMemcpyHostToDevice,
+            stream));
+}
+
+} // namespace
+
 GpuIndexHNSW::GpuIndexHNSW(
         GpuResourcesProvider* provider,
         int dims,
@@ -270,6 +298,8 @@ void GpuIndexHNSW::searchHost(
             cudaMemcpyDefault,
             stream));
 
+    upload_bitset_if_needed(sc, sp, nq, stream);
+
     gpu_hnsw_search(stream, sp, idx, sc, nq, k);
 
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
@@ -359,6 +389,8 @@ void GpuIndexHNSW::searchHostInt8(
     // Synchronize to ensure host buffers (fp32_q) are not freed
     // while the async copies are in flight.
     GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    upload_bitset_if_needed(sc, sp, nq, stream);
 
     gpu_hnsw_search(stream, sp, idx, sc, nq, k);
 
