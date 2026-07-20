@@ -79,9 +79,16 @@ void GpuHnswSearchScratch::ensure(
                 static_cast<size_t>(nq) * sizeof(uint32_t)));
         entry_cap = nq;
     }
+    // The visited bitmap is only ever indexed by the chunk-local query index
+    // (see the launch loop in gpu_hnsw_search), so size it for one chunk rather
+    // than the full batch. This is the fix for the grow-only OOM: without the
+    // chunk cap, a large nq (or high-concurrency high-water mark) sized this at
+    // nq * ceil(N/32) * 4 and never released it. Must match the chunk used at
+    // launch time.
+    int bm_nq = gpu_hnsw_bitmap_chunk(nq, N);
     int bitmap_words = (N + 31) / 32;
     size_t need_bm =
-            static_cast<size_t>(nq) * bitmap_words * sizeof(uint32_t);
+            static_cast<size_t>(bm_nq) * bitmap_words * sizeof(uint32_t);
     if (need_bm > bitmap_bytes) {
         if (d_visited_bitmaps)
             cudaFree(d_visited_bitmaps);

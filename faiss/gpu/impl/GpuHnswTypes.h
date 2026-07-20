@@ -25,9 +25,11 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -75,6 +77,60 @@ enum class GpuHnswDatasetType {
     FP16 = 2,
     BF16 = 3,
 };
+
+// Cap (bytes) on the per-search visited bitmap for a single scratch slot. The
+// bitmap is nq * ceil(N/32) * 4 bytes and is grow-only per slot, so a large
+// query batch or high search concurrency (one bitmap per pool slot) can grow it
+// until it exhausts device memory. Observed regression: 16 concurrent batch=512
+// searches on a 538M-row segment grew the pool to ~97 of ~98 GB and OOM'd every
+// subsequent allocation. Bounding the bitmap and processing queries in
+// nq-chunks caps it regardless of batch size / concurrency.
+//
+// Tunable via environment (re-read on each call so tests can toggle it; getenv
+// is negligible next to a GPU search): GPU_HNSW_BITMAP_BYTES sets the cap in
+// bytes (used by tests to force the multi-chunk path on tiny inputs) and takes
+// precedence over GPU_HNSW_BITMAP_MB (megabytes). Default 256 MiB. The value is
+// only a chunking bound, so any positive value is safe (the chunk is clamped to
+// >= 1 query regardless).
+inline size_t gpu_hnsw_bitmap_cap_bytes() {
+    if (const char* eb = std::getenv("GPU_HNSW_BITMAP_BYTES")) {
+        long long v = std::atoll(eb);
+        if (v > 0) {
+            return static_cast<size_t>(v);
+        }
+    }
+    size_t mb = 256;
+    if (const char* e = std::getenv("GPU_HNSW_BITMAP_MB")) {
+        long v = std::atol(e);
+        if (v > 0) {
+            mb = static_cast<size_t>(v);
+        }
+    }
+    return mb * (static_cast<size_t>(1) << 20);
+}
+
+// Number of queries to process per launch so the visited bitmap stays within
+// gpu_hnsw_bitmap_cap_bytes(). Always in [1, nq]; returns nq when the whole
+// batch already fits, so small segments are chunked into a single pass and see
+// no behavior change. Queries are independent in HNSW search, so chunking does
+// not change per-query results. Must stay in lockstep with the bitmap sizing in
+// GpuHnswSearchScratch::ensure() and the launch loop in gpu_hnsw_search().
+inline int gpu_hnsw_bitmap_chunk(int nq, int N) {
+    if (nq <= 0) {
+        return nq;
+    }
+    size_t per_query =
+            static_cast<size_t>((N + 31) / 32) * sizeof(uint32_t);
+    if (per_query == 0) {
+        return nq;
+    }
+    size_t cap_q = gpu_hnsw_bitmap_cap_bytes() / per_query;
+    if (cap_q < 1) {
+        cap_q = 1;
+    }
+    return (cap_q >= static_cast<size_t>(nq)) ? nq
+                                              : static_cast<int>(cap_q);
+}
 
 struct GpuHnswSearchParams {
     int ef = 200;
