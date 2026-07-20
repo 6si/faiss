@@ -126,18 +126,24 @@ inline void gpu_hnsw_search(
                                   const QueryT* d_layer0_queries) {
         int N_int = static_cast<int>(idx.n_rows);
 
-        // Brute-force launcher (shares the current dtype specialization). The
-        // block must be a power of two <= kBruteForceMaxBlock for the tree
-        // reduction. Grid is always num_queries: the up-front path uses the
-        // identity mapping, the per-query fallback reads its worklist length
-        // from d_num on the device (no host sync between graph and BF).
+        // Brute-force launcher (shares the current dtype specialization). It
+        // operates on a chunk of `num_items` queries whose scratch pointers
+        // (q0/nb0/ds0) are already offset by the caller; when non-null the
+        // worklist holds chunk-local query indices, matching the offset outputs.
+        // Grid is num_items: the up-front path uses the identity mapping, the
+        // per-query fallback reads its worklist length from d_num on the device
+        // (no host sync between graph and BF). Block must be a power of two <=
+        // kBruteForceMaxBlock for the tree reduction.
         int bf_block = 128;
-        auto launch_bf = [&](const uint32_t* worklist,
+        auto launch_bf = [&](const QueryT* q0,
+                             uint64_t* nb0,
+                             float* ds0,
+                             const uint32_t* worklist,
                              const int* d_num,
                              int num_items) {
             hnsw_kernel::brute_force_topk_kernel<DataT, QueryT, USE_DP4A>
-                    <<<num_queries, bf_block, 0, stream>>>(
-                            d_layer0_queries,
+                    <<<num_items, bf_block, 0, stream>>>(
+                            q0,
                             d_data,
                             d_inv_norms,
                             sc.d_bitset,
@@ -148,53 +154,14 @@ inline void gpu_hnsw_search(
                             dim,
                             k,
                             idx.use_ip,
-                            sc.d_neighbors,
-                            sc.d_distances);
+                            nb0,
+                            ds0);
             GPU_HNSW_CUDA_CHECK(cudaGetLastError());
         };
 
-        // Up-front brute force skips the graph search entirely.
-        if (up_front_bf) {
-            launch_bf(nullptr, nullptr, num_queries);
-            return;
-        }
-
-        if (num_upper_layers > 0) {
-            auto* d_layer_ptrs = static_cast<hnsw_kernel::upper_layer_ptrs*>(
-                    idx.d_upper_layer_ptrs);
-
-            int warps_per_block = 4;
-            int threads_per_block = warps_per_block * 32;
-            int num_blocks =
-                    (num_queries + warps_per_block - 1) / warps_per_block;
-
-            hnsw_kernel::upper_layer_search_kernel<DataT>
-                    <<<num_blocks, threads_per_block, 0, stream>>>(
-                            sc.d_queries,
-                            d_data,
-                            d_inv_norms,
-                            d_layer_ptrs,
-                            sc.d_entry_points,
-                            idx.entry_point,
-                            num_queries,
-                            dim,
-                            num_upper_layers,
-                            idx.use_ip);
-            GPU_HNSW_CUDA_CHECK(cudaGetLastError());
-        } else {
-            std::vector<uint32_t> h_eps(num_queries, idx.entry_point);
-            GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
-                    sc.d_entry_points,
-                    h_eps.data(),
-                    num_queries * sizeof(uint32_t),
-                    cudaMemcpyHostToDevice,
-                    stream));
-            // h_eps is stack-local; synchronize before it is destroyed so the
-            // copy never reads freed memory (safe even if the source buffer is
-            // ever switched to pinned host memory).
-            GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
-        }
-
+        // --- Shared-memory sizing / ef finalization ---
+        // Query-count independent (depends only on ef/search_width/M and the
+        // device smem limit), so compute it once before the chunk loop.
         int block_size =
                 params.thread_block_size > 0 ? params.thread_block_size : 128;
 
@@ -215,13 +182,13 @@ inline void gpu_hnsw_search(
             }
         }
 
+        // The bitonic sort in the parallel merge needs a power-of-two staging
+        // capacity, one thread per slot. Pad up to the next power of two
+        // (handles non-power-of-two 2*M) and grow the block so every staging
+        // slot is owned by a thread.
+        int max_staging =
+                hnsw_kernel::padded_staging_capacity(sw, idx.max_degree0);
         {
-            // The bitonic sort in the parallel merge needs a power-of-two
-            // staging capacity, one thread per slot. Pad up to the next power
-            // of two (handles non-power-of-two 2*M) and grow the block so every
-            // staging slot is owned by a thread.
-            int max_staging = hnsw_kernel::padded_staging_capacity(
-                    sw, idx.max_degree0);
             if (block_size < max_staging) {
                 block_size = max_staging;
             }
@@ -293,33 +260,35 @@ inline void gpu_hnsw_search(
         size_t smem_size = hnsw_kernel::calc_layer0_smem_size(
                 ef, sw, idx.max_degree0, has_filter ? ef_inv : 0);
 
-        // Opt into >48 KiB dynamic shared memory when the device supports it;
-        // without this the kernel launch would fail for large ef. This is
-        // cached per kernel instantiation: cudaFuncSetAttribute configures the
-        // kernel's max dynamic shared memory globally, so it only needs to run
-        // once per (kernel, high-water size) rather than on every search. The
-        // statics live in this generic-lambda body, which is instantiated once
-        // per <DataT, QueryT, USE_DP4A> combination.
-        //
-        // The mutex makes the check-set-store atomic and monotonic: without it,
-        // two concurrent searches with different smem sizes can interleave so a
-        // smaller-ef search's cudaFuncSetAttribute runs *after* a larger one,
-        // downgrading the kernel's global attribute below what a recorded
-        // high-water mark implies, and a later intermediate search then skips
-        // the set (thinks it's configured) and fails to launch. Under the lock
-        // the attribute only ever grows, and is always >= the current launch's
-        // requirement before we proceed.
-        size_t bitmap_bytes = hnsw_kernel::calc_visited_bitmap_size(
-                num_queries, N_int);
-
-        GPU_HNSW_CUDA_CHECK(
-                cudaMemsetAsync(sc.d_visited_bitmaps, 0, bitmap_bytes, stream));
-
-        // The graph kernel is templated on HAS_FILTER; the filtered and
-        // unfiltered instantiations are distinct __global__ functions, so each
-        // needs its own cudaFuncSetAttribute high-water tracking. run_graph is
-        // a nested generic lambda so its statics are per-<...,HAS_FILTER>.
-        auto run_graph = [&]<bool HAS_FILTER>() {
+        // Graph search + per-query brute-force fallback for one chunk of `cnq`
+        // queries. The scratch pointers (q0/ep0/nb0/ds0) are offset by the
+        // caller so the kernels' chunk-local blockIdx.x maps to the right
+        // global query; the visited bitmap is the base buffer, indexed by the
+        // same chunk-local index. The graph kernel is templated on HAS_FILTER;
+        // the filtered and unfiltered instantiations are distinct __global__
+        // functions, so each needs its own cudaFuncSetAttribute high-water
+        // tracking (the statics below are per-<...,HAS_FILTER>).
+        auto run_graph = [&]<bool HAS_FILTER>(
+                                 const QueryT* q0,
+                                 uint32_t* ep0,
+                                 uint64_t* nb0,
+                                 float* ds0,
+                                 int cnq) {
+            // Opt into >48 KiB dynamic shared memory when the device supports
+            // it; without this the kernel launch would fail for large ef. This
+            // is cached per kernel instantiation: cudaFuncSetAttribute
+            // configures the kernel's max dynamic shared memory globally, so it
+            // only needs to run once per (kernel, high-water size).
+            //
+            // The mutex makes the check-set-store atomic and monotonic: without
+            // it, two concurrent searches with different smem sizes can
+            // interleave so a smaller-ef search's cudaFuncSetAttribute runs
+            // *after* a larger one, downgrading the kernel's global attribute
+            // below what a recorded high-water mark implies, and a later
+            // intermediate search then skips the set (thinks it's configured)
+            // and fails to launch. Under the lock the attribute only ever grows,
+            // and is always >= the current launch's requirement before we
+            // proceed.
             if (smem_size > 49152) {
                 static std::mutex configured_smem_mutex;
                 static size_t configured_smem = 0;
@@ -354,16 +323,16 @@ inline void gpu_hnsw_search(
                     DataT,
                     QueryT,
                     USE_DP4A,
-                    HAS_FILTER><<<num_queries, block_size, smem_size, stream>>>(
-                    d_layer0_queries,
+                    HAS_FILTER><<<cnq, block_size, smem_size, stream>>>(
+                    q0,
                     d_data,
                     d_inv_norms,
                     idx.d_layer0_graph,
-                    sc.d_entry_points,
+                    ep0,
                     sc.d_visited_bitmaps,
-                    sc.d_neighbors,
-                    sc.d_distances,
-                    num_queries,
+                    nb0,
+                    ds0,
+                    cnq,
                     N_int,
                     dim,
                     idx.max_degree0,
@@ -383,20 +352,93 @@ inline void gpu_hnsw_search(
 
             // Per-query brute-force fallback: queries whose graph search fell
             // short (fewer than k live results) were appended to sc.d_needs_bf
-            // by the graph kernel. Launch a full-width grid; each block reads
-            // the device worklist length and early-exits when out of range, so
-            // no host sync is needed between the two kernels.
+            // (chunk-local indices) by the graph kernel. Launch a full-width
+            // grid; each block reads the device worklist length and early-exits
+            // when out of range, so no host sync is needed between the two
+            // kernels.
             if constexpr (HAS_FILTER) {
                 if (!disable_bf) {
-                    launch_bf(sc.d_needs_bf, sc.d_needs_bf_count, num_queries);
+                    launch_bf(q0, nb0, ds0, sc.d_needs_bf,
+                              sc.d_needs_bf_count, cnq);
                 }
             }
         };
 
-        if (has_filter) {
-            run_graph.template operator()<true>();
-        } else {
-            run_graph.template operator()<false>();
+        // --- Query chunking to bound the visited-bitmap VRAM ---
+        // Process the batch in chunks of at most chunk_nq queries so the visited
+        // bitmap (sized in GpuHnswSearchScratch::ensure with the same chunk)
+        // stays within the VRAM cap regardless of nq / search concurrency. For
+        // small segments chunk_nq == num_queries -> a single pass, identical to
+        // the pre-chunk behavior.
+        int chunk_nq = gpu_hnsw_bitmap_chunk(num_queries, N_int);
+        for (int c0 = 0; c0 < num_queries; c0 += chunk_nq) {
+            int cnq = std::min(chunk_nq, num_queries - c0);
+            // Chunk-offset scratch pointers. q0 is the layer-0 query buffer
+            // (int8 on the DP4A path, else fp32); fq0 is always the fp32 buffer
+            // used by the upper-layer greedy descent.
+            const QueryT* q0 =
+                    d_layer0_queries + static_cast<int64_t>(c0) * dim;
+            const float* fq0 = sc.d_queries + static_cast<int64_t>(c0) * dim;
+            uint32_t* ep0 = sc.d_entry_points + c0;
+            uint64_t* nb0 = sc.d_neighbors + static_cast<int64_t>(c0) * k;
+            float* ds0 = sc.d_distances + static_cast<int64_t>(c0) * k;
+
+            // Up-front brute force skips the graph search entirely (does not
+            // touch the visited bitmap, but still runs per chunk so its outputs
+            // land at the right offsets).
+            if (up_front_bf) {
+                launch_bf(q0, nb0, ds0, nullptr, nullptr, cnq);
+                continue;
+            }
+
+            if (num_upper_layers > 0) {
+                auto* d_layer_ptrs =
+                        static_cast<hnsw_kernel::upper_layer_ptrs*>(
+                                idx.d_upper_layer_ptrs);
+
+                int warps_per_block = 4;
+                int threads_per_block = warps_per_block * 32;
+                int num_blocks =
+                        (cnq + warps_per_block - 1) / warps_per_block;
+
+                hnsw_kernel::upper_layer_search_kernel<DataT>
+                        <<<num_blocks, threads_per_block, 0, stream>>>(
+                                fq0,
+                                d_data,
+                                d_inv_norms,
+                                d_layer_ptrs,
+                                ep0,
+                                idx.entry_point,
+                                cnq,
+                                dim,
+                                num_upper_layers,
+                                idx.use_ip);
+                GPU_HNSW_CUDA_CHECK(cudaGetLastError());
+            } else {
+                std::vector<uint32_t> h_eps(cnq, idx.entry_point);
+                GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+                        ep0,
+                        h_eps.data(),
+                        static_cast<size_t>(cnq) * sizeof(uint32_t),
+                        cudaMemcpyHostToDevice,
+                        stream));
+                // h_eps is stack-local; synchronize before it is destroyed so
+                // the copy never reads freed memory (safe even if the source
+                // buffer is ever switched to pinned host memory).
+                GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
+            // Zero this chunk's visited bitmap (reused across chunks).
+            size_t bitmap_bytes =
+                    hnsw_kernel::calc_visited_bitmap_size(cnq, N_int);
+            GPU_HNSW_CUDA_CHECK(cudaMemsetAsync(
+                    sc.d_visited_bitmaps, 0, bitmap_bytes, stream));
+
+            if (has_filter) {
+                run_graph.template operator()<true>(q0, ep0, nb0, ds0, cnq);
+            } else {
+                run_graph.template operator()<false>(q0, ep0, nb0, ds0, cnq);
+            }
         }
     };
 
