@@ -56,6 +56,17 @@ void normalizeRows(std::vector<float>& v, int n, int dim) {
     }
 }
 
+// Map uniform [0,1) components to integer values in [-100, 100]. QT_8bit_-
+// direct_signed is a fixed code=(x+128) map with no trained range, so it only
+// represents integer-valued data in [-128,127]; feeding it small floats (as
+// randVecs produces) collapses every code to ~0. INT8 vectors in production are
+// genuine int8 values, so this is the representative input for the codec.
+void toInt8Range(std::vector<float>& v) {
+    for (float& x : v) {
+        x = std::round((x - 0.5f) * 200.0f);
+    }
+}
+
 // Build a CPU IndexHNSW, clone it to GPU via index_cpu_to_gpu, and assert the
 // GPU search recall against exact (IndexFlat) ground truth is high.
 void testHnswRecall(
@@ -64,12 +75,17 @@ void testHnswRecall(
         int numVecs,
         int dim,
         bool normalize,
-        float minRecall) {
+        float minRecall,
+        bool int8Range = false) {
     int numQuery = 64;
     int k = 10;
 
     std::vector<float> vecs = faiss::gpu::randVecs(numVecs, dim);
     std::vector<float> queries = faiss::gpu::randVecs(numQuery, dim);
+    if (int8Range) {
+        toInt8Range(vecs);
+        toInt8Range(queries);
+    }
     if (normalize) {
         normalizeRows(vecs, numVecs, dim);
         normalizeRows(queries, numQuery, dim);
@@ -160,7 +176,9 @@ TEST(TestGpuIndexHNSW, Flat_Cosine) {
 }
 
 // INT8 storage via QT_8bit_direct_signed (native DP4A path). dim % 4 == 0 so
-// the DP4A kernel is exercised; quantization lowers the recall bar.
+// the DP4A kernel is exercised; quantization lowers the recall bar. The input is
+// int8-range integer data (int8Range=true) so the direct-signed codec is
+// exercised on representable values instead of collapsing sub-1.0 floats to ~0.
 TEST(TestGpuIndexHNSW, SQ_Int8_L2) {
     int dim = 64;
     faiss::IndexHNSWSQ cpuIndex(
@@ -168,7 +186,14 @@ TEST(TestGpuIndexHNSW, SQ_Int8_L2) {
             faiss::ScalarQuantizer::QT_8bit_direct_signed,
             16,
             faiss::METRIC_L2);
-    testHnswRecall(cpuIndex, faiss::METRIC_L2, 4000, dim, false, 0.70f);
+    testHnswRecall(
+            cpuIndex,
+            faiss::METRIC_L2,
+            4000,
+            dim,
+            false,
+            0.70f,
+            /*int8Range=*/true);
 }
 
 TEST(TestGpuIndexHNSW, SQ_Fp16_L2) {
