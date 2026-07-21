@@ -178,6 +178,35 @@ TEST(TestGpuIndexHNSW, SQ_Fp16_L2) {
     testHnswRecall(cpuIndex, faiss::METRIC_L2, 4000, dim, false, 0.88f);
 }
 
+// Cosine over scalar-quantized storage = normalize + IP with the SQ codec.
+// fp16 and bf16 represent normalized components (magnitude ~1/sqrt(d))
+// accurately, so recall stays high. int8 cosine has NO gate here on purpose:
+// QT_8bit_direct_signed is a fixed code=x+128 map, so normalized vectors
+// collapse onto a few of the 256 levels and int8-cosine recall is poor at the
+// faiss level. The Knowhere consumer therefore re-encodes int8 cosine as fp16
+// (see faiss_hnsw.cc ToVanillaHnsw), which is exactly SQ_Fp16_Cosine below.
+TEST(TestGpuIndexHNSW, SQ_Fp16_Cosine) {
+    int dim = 64;
+    faiss::IndexHNSWSQ cpuIndex(
+            dim,
+            faiss::ScalarQuantizer::QT_fp16,
+            16,
+            faiss::METRIC_INNER_PRODUCT);
+    testHnswRecall(
+            cpuIndex, faiss::METRIC_INNER_PRODUCT, 4000, dim, true, 0.85f);
+}
+
+TEST(TestGpuIndexHNSW, SQ_Bf16_Cosine) {
+    int dim = 64;
+    faiss::IndexHNSWSQ cpuIndex(
+            dim,
+            faiss::ScalarQuantizer::QT_bf16,
+            16,
+            faiss::METRIC_INNER_PRODUCT);
+    testHnswRecall(
+            cpuIndex, faiss::METRIC_INNER_PRODUCT, 4000, dim, true, 0.80f);
+}
+
 // copyTo / index_gpu_to_cpu is intentionally unsupported (search-only index).
 TEST(TestGpuIndexHNSW, CopyToThrows) {
     int dim = 32;
