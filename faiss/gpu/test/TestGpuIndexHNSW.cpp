@@ -241,3 +241,12 @@ TEST(TestGpuIndexHNSW, RejectsUnsupportedMetric) {
             faiss::gpu::GpuIndexHNSW(&res, dim, faiss::METRIC_L1),
             faiss::FaissException);
 }
+
+int main(int argc, char** argv) {
+    testing::InitGoogleTest(&argc, argv);
+
+    // just run with a fixed test seed
+    faiss::gpu::setTestSeed(100);
+
+    return RUN_ALL_TESTS();
+}
