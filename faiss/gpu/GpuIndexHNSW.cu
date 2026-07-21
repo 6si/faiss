@@ -21,13 +21,12 @@
  * limitations under the License.
  */
 
+#include <faiss/IndexHNSW.h>
 #include <faiss/IndexScalarQuantizer.h>
-#include <faiss/cppcontrib/knowhere/IndexCosine.h>
-#include <faiss/cppcontrib/knowhere/IndexHNSW.h>
 #include <faiss/gpu/GpuIndexHNSW.h>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
 #include <faiss/gpu/utils/DeviceUtils.h>
-#include <faiss/gpu/impl/GpuHnswBuild.cuh>
+#include <faiss/gpu/impl/GpuHnswBuildVanilla.cuh>
 #include <faiss/gpu/impl/GpuHnswSearch.cuh>
 
 #include <cstdio>
@@ -72,15 +71,39 @@ GpuIndexHNSW::GpuIndexHNSW(
         GpuIndexHNSWConfig config)
         : GpuIndex(provider->getResources(), dims, metric, 0.0f, config),
           hnswConfig_(config) {
+    FAISS_THROW_IF_NOT_MSG(
+            metric == faiss::METRIC_L2 ||
+                    metric == faiss::METRIC_INNER_PRODUCT,
+            "GpuIndexHNSW supports METRIC_L2 and METRIC_INNER_PRODUCT only "
+            "(cosine = normalize + inner product)");
     this->is_trained = false;
+}
+
+GpuIndexHNSW::GpuIndexHNSW(
+        GpuResourcesProvider* provider,
+        const faiss::IndexHNSW* index,
+        GpuIndexHNSWConfig config)
+        : GpuIndex(
+                  provider->getResources(),
+                  index->d,
+                  index->metric_type,
+                  0.0f,
+                  config),
+          hnswConfig_(config) {
+    this->is_trained = false;
+    copyFrom(index);
 }
 
 GpuIndexHNSW::~GpuIndexHNSW() = default;
 
-void GpuIndexHNSW::copyFrom(
-        const faiss::cppcontrib::knowhere::IndexHNSW* index) {
+void GpuIndexHNSW::copyFrom(const faiss::IndexHNSW* index) {
     FAISS_THROW_IF_NOT_MSG(index, "index must not be null");
     FAISS_THROW_IF_NOT_MSG(index->ntotal > 0, "index must not be empty");
+    FAISS_THROW_IF_NOT_MSG(
+            index->metric_type == faiss::METRIC_L2 ||
+                    index->metric_type == faiss::METRIC_INNER_PRODUCT,
+            "GpuIndexHNSW supports METRIC_L2 and METRIC_INNER_PRODUCT only "
+            "(cosine = normalize + inner product)");
 
     DeviceScope scope(config_.device);
 
@@ -88,60 +111,30 @@ void GpuIndexHNSW::copyFrom(
     this->metric_type = index->metric_type;
     this->ntotal = index->ntotal;
 
-    // Detect cosine from index type (IndexHNSWFlatCosine / IndexHNSWSQCosine
-    // implement HasInverseL2Norms).
-    bool is_cosine =
-            dynamic_cast<const faiss::cppcontrib::knowhere::HasInverseL2Norms*>(
-                    index) != nullptr;
-    bool use_ip =
-            is_cosine || (index->metric_type == faiss::METRIC_INNER_PRODUCT);
-
-    is_cosine_ = is_cosine;
+    bool use_ip = index->metric_type == faiss::METRIC_INNER_PRODUCT;
     use_ip_ = use_ip;
 
     if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
-        deviceIndex_ =
-                from_faiss_hnsw_sq(*index, use_ip, is_cosine, config_.device);
+        deviceIndex_ = from_index_hnsw_sq(*index, use_ip, config_.device);
     } else {
-        deviceIndex_ =
-                from_faiss_hnsw_flat(*index, use_ip, is_cosine, config_.device);
+        deviceIndex_ = from_index_hnsw_flat(*index, use_ip, config_.device);
     }
 
     this->is_trained = true;
 }
 
-void GpuIndexHNSW::copyFromWithMetric(
-        const faiss::cppcontrib::knowhere::IndexHNSW* index,
-        bool use_ip,
-        bool is_cosine) {
-    FAISS_THROW_IF_NOT_MSG(index, "index must not be null");
-    FAISS_THROW_IF_NOT_MSG(index->ntotal > 0, "index must not be empty");
-
-    DeviceScope scope(config_.device);
-
-    this->d = index->d;
-    this->metric_type = index->metric_type;
-    this->ntotal = index->ntotal;
-
-    is_cosine_ = is_cosine;
-    use_ip_ = use_ip;
-
-    if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
-        deviceIndex_ =
-                from_faiss_hnsw_sq(*index, use_ip, is_cosine, config_.device);
-    } else {
-        deviceIndex_ =
-                from_faiss_hnsw_flat(*index, use_ip, is_cosine, config_.device);
-    }
-
-    this->is_trained = true;
+void GpuIndexHNSW::copyTo(faiss::IndexHNSW* /*index*/) const {
+    FAISS_THROW_MSG(
+            "GpuIndexHNSW is search-only and does not support copyTo(). "
+            "The GPU index uploads a CPU-built graph and does not retain a "
+            "reconstructable CPU copy of the link structure. Keep the source "
+            "faiss::IndexHNSW to obtain a CPU index.");
 }
 
 void GpuIndexHNSW::reset() {
     deviceIndex_.reset();
     this->ntotal = 0;
     this->is_trained = false;
-    is_cosine_ = false;
     use_ip_ = false;
 }
 

@@ -21,22 +21,21 @@
  * limitations under the License.
  */
 
-// Converts a FAISS HNSW index (CSR graph) + vectors into a
-// GpuHnswDeviceIndex on device memory.
-//
-// This version is adapted for Knowhere's FAISS fork which uses
-// faiss::cppcontrib::knowhere::IndexHNSW / HNSW types.
+// Graph/vector upload helpers shared by the HNSW->GPU build paths. These are
+// intentionally free of any dependency on a specific IndexHNSW flavor:
+//   - extract_hnsw_layers() is templated on the graph struct and works with any
+//     type exposing the faiss::HNSW accessor interface (neighbor_range,
+//     nb_neighbors, neighbors, levels, entry_point, max_level).
+//   - the upload_* helpers take raw host buffers.
+// The flavor-specific entry points (from a vanilla faiss::IndexHNSW, or from
+// Knowhere's cppcontrib IndexHNSW) live in separate headers and reuse these.
 
 #pragma once
 
 #include <cuda_runtime.h>
-#include <faiss/IndexFlat.h>
-#include <faiss/IndexScalarQuantizer.h>
-#include <faiss/cppcontrib/knowhere/IndexCosine.h>
-#include <faiss/cppcontrib/knowhere/IndexHNSW.h>
-#include <faiss/cppcontrib/knowhere/impl/HNSW.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -50,7 +49,7 @@
 // reachable from host-compiled unit tests without pulling in device kernels.
 #define GPU_HNSW_BUILD_CUDA_CHECK(expr)                                  \
     do {                                                                 \
-        if (faiss::gpu::GpuHnswUploadFaultInjection::should_fail()) {     \
+        if (faiss::gpu::GpuHnswUploadFaultInjection::should_fail()) {    \
             throw std::runtime_error(                                    \
                     std::string("CUDA error (injected): simulated ") +   \
                     "upload failure at " + __FILE__ + ":" +              \
@@ -68,9 +67,9 @@
 namespace faiss {
 namespace gpu {
 
-/// Extract HNSW graph layers from a Knowhere HNSW struct.
-/// Template parameter HnswT can be faiss::cppcontrib::knowhere::HNSW
-/// or faiss::HNSW — any type exposing this interface:
+/// Extract HNSW graph layers from an HNSW struct.
+/// Template parameter HnswT can be faiss::HNSW or any type exposing the same
+/// interface:
 ///   - neighbor_range(node, layer, &begin, &end)
 ///   - nb_neighbors(layer) -> int
 ///   - neighbors            : flat neighbor array indexed by neighbor_range
@@ -230,16 +229,12 @@ inline void upload_graph_to_gpu(
                 ptrs_bytes,
                 cudaMemcpyHostToDevice));
     }
-
 }
 
-// Upload precomputed per-row inverse L2 norms to the device. These must be the
-// norms of the *original* input vectors as recorded by the CPU cosine index
-// (HasInverseL2Norms::get_inverse_l2_norms()), NOT norms recomputed from
-// lossily-decoded codes — otherwise cosine scores and graph traversal diverge
-// from the CPU index for lossy SQ (SQ8 / fp16 / bf16). The search kernel
-// computes score = IP(query, decoded_db) * inv_norm[row], mirroring the CPU
-// WithCosineNormDistanceComputer.
+// Upload precomputed per-row inverse L2 norms to the device. Optional: only the
+// Knowhere cosine path (which records the *original* input norms in the CPU
+// index) uses this; the vanilla faiss path leaves d_inv_norms == nullptr and
+// obtains cosine by normalizing the stored vectors (see upload_fp32_dataset).
 inline void upload_inv_norms(
         GpuHnswDeviceIndex& idx,
         const float* inv_norms,
@@ -281,9 +276,7 @@ inline void upload_fp32_dataset(
 // Upload fp16 (QT_fp16) or bf16 (QT_bf16) ScalarQuantizer codes to the GPU in
 // their native 2-byte layout. faiss stores these codes row-major as raw IEEE
 // half / bfloat16, which are bit-compatible with CUDA half / __nv_bfloat16, so
-// the bytes are copied verbatim (no up-conversion to fp32). For cosine, the CPU
-// index's original inverse L2 norms are applied at search time — mirroring the
-// int8 path, since the stored codes are not normalized.
+// the bytes are copied verbatim (no up-conversion to fp32).
 inline void upload_halfwidth_dataset(
         GpuHnswDeviceIndex& idx,
         const uint8_t* codes,
@@ -298,10 +291,10 @@ inline void upload_halfwidth_dataset(
             idx.d_dataset, codes, dataset_bytes, cudaMemcpyHostToDevice));
     idx.dataset_type = dtype;
 
-    // The stored fp16/bf16 codes are not normalized, so cosine needs the CPU
-    // index's original inverse norms (not norms recomputed from the lossy
-    // decoded values). Mirrors the int8 path.
-    if (is_cosine)
+    // fp16/bf16 codes are not normalized in place; when original inverse norms
+    // are supplied (Knowhere path) apply them at search time, else the vanilla
+    // path handles cosine via query/vector normalization upstream.
+    if (is_cosine && stored_inv_norms != nullptr)
         upload_inv_norms(idx, stored_inv_norms, n_rows);
 }
 
@@ -328,120 +321,8 @@ inline void upload_int8_dataset(
             cudaMemcpyHostToDevice));
     idx.dataset_type = GpuHnswDatasetType::INT8;
 
-    // Apply the CPU index's original inverse norms for cosine. For
-    // QT_8bit_direct_signed the codes are the original data (lossless), so these
-    // match a recompute; using the stored norms keeps all cosine paths uniform
-    // and bit-exact with the CPU index.
-    if (is_cosine)
+    if (is_cosine && stored_inv_norms != nullptr)
         upload_inv_norms(idx, stored_inv_norms, n_rows);
-}
-
-/// Build from Knowhere's HNSW index with SQ storage.
-inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
-        const faiss::cppcontrib::knowhere::IndexHNSW& hnsw_index,
-        bool use_ip,
-        bool is_cosine = false,
-        int device = 0) {
-    const auto* sq_storage =
-            dynamic_cast<const faiss::IndexScalarQuantizer*>(
-                    hnsw_index.storage);
-    if (!sq_storage)
-        throw std::runtime_error(
-                "gpu_hnsw: storage is not IndexScalarQuantizer");
-
-    int64_t n_rows = hnsw_index.ntotal;
-    int64_t dim = hnsw_index.d;
-
-    auto idx = std::make_unique<GpuHnswDeviceIndex>();
-    idx->n_rows = n_rows;
-    idx->dim = dim;
-    idx->use_ip = use_ip;
-    idx->device = device;
-    idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, device);
-
-    auto qtype = sq_storage->sq.qtype;
-
-    // For cosine, use the CPU index's inverse L2 norms computed from the
-    // *original* input vectors (HasInverseL2Norms::get_inverse_l2_norms()).
-    // Recomputing norms from lossily-decoded/quantized codes would diverge from
-    // the CPU index's scores and graph traversal for lossy SQ.
-    const float* stored_inv_norms = nullptr;
-    if (is_cosine) {
-        // The cosine norms live on the SQ storage (IndexScalarQuantizerCosine),
-        // which implements HasInverseL2Norms — not on the outer IndexHNSW.
-        const auto* cos = dynamic_cast<
-                const faiss::cppcontrib::knowhere::HasInverseL2Norms*>(
-                sq_storage);
-        if (!cos || !cos->get_inverse_l2_norms())
-            throw std::runtime_error(
-                    "gpu_hnsw: cosine SQ index missing inverse L2 norms");
-        stored_inv_norms = cos->get_inverse_l2_norms();
-    }
-
-    if (qtype == faiss::ScalarQuantizer::QT_8bit_direct_signed) {
-        upload_int8_dataset(
-                *idx, sq_storage->codes.data(), n_rows, is_cosine,
-                stored_inv_norms);
-    } else if (
-            qtype == faiss::ScalarQuantizer::QT_fp16 ||
-            qtype == faiss::ScalarQuantizer::QT_bf16) {
-        // Keep fp16/bf16 in their native 2-byte layout on the GPU.
-        GpuHnswDatasetType dtype =
-                (qtype == faiss::ScalarQuantizer::QT_fp16)
-                        ? GpuHnswDatasetType::FP16
-                        : GpuHnswDatasetType::BF16;
-        upload_halfwidth_dataset(
-                *idx,
-                sq_storage->codes.data(),
-                n_rows,
-                is_cosine,
-                dtype,
-                stored_inv_norms);
-    } else {
-        // Other SQ types (e.g. unsigned QT_8bit / SQ8) are decoded to fp32 and
-        // uploaded un-normalized; the stored original inverse norms are applied
-        // in the kernel, matching the CPU cosine computer for lossy codes.
-        std::vector<float> h_vectors(n_rows * dim);
-        sq_storage->sa_decode(
-                n_rows, sq_storage->codes.data(), h_vectors.data());
-        upload_fp32_dataset(
-                *idx, h_vectors, n_rows, is_cosine, stored_inv_norms);
-    }
-
-    upload_graph_to_gpu(*idx, hnsw_index.hnsw, n_rows);
-    return idx;
-}
-
-/// Build from Knowhere's HNSW index with Flat storage.
-inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_flat(
-        const faiss::cppcontrib::knowhere::IndexHNSW& hnsw_index,
-        bool use_ip,
-        bool is_cosine = false,
-        int device = 0) {
-    const auto* flat_storage =
-            dynamic_cast<const faiss::IndexFlat*>(hnsw_index.storage);
-    if (!flat_storage)
-        throw std::runtime_error("gpu_hnsw: storage is not IndexFlat");
-
-    int64_t n_rows = hnsw_index.ntotal;
-    int64_t dim = hnsw_index.d;
-
-    // Use reconstruct_n instead of get_xb() — get_xb() can return a
-    // device pointer in GPU querynode context, causing SIGSEGV when
-    // accessed from CPU.
-    std::vector<float> h_vectors(n_rows * dim);
-    flat_storage->reconstruct_n(0, n_rows, h_vectors.data());
-
-    auto idx = std::make_unique<GpuHnswDeviceIndex>();
-    idx->n_rows = n_rows;
-    idx->dim = dim;
-    idx->use_ip = use_ip;
-    idx->device = device;
-    idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, device);
-
-    upload_fp32_dataset(*idx, h_vectors, n_rows, is_cosine);
-    upload_graph_to_gpu(*idx, hnsw_index.hnsw, n_rows);
-    return idx;
 }
 
 } // namespace gpu

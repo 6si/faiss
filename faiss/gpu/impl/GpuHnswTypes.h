@@ -38,7 +38,7 @@ namespace faiss {
 namespace gpu {
 
 // Test-only fault injection for the device-upload path (consulted by
-// GPU_HNSW_BUILD_CUDA_CHECK in GpuHnswBuild.cuh). Production code never arms it
+// GPU_HNSW_BUILD_CUDA_CHECK in GpuHnswBuildCommon.cuh). Production code never arms it
 // (the countdown stays 0), so the check is a single relaxed atomic load per
 // wrapped CUDA call with no runtime effect. Unit tests call arm(n) so the n-th
 // subsequent wrapped CUDA call reports a simulated failure, exercising

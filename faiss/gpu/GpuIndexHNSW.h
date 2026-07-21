@@ -31,11 +31,7 @@
 
 namespace faiss {
 
-namespace cppcontrib {
-namespace knowhere {
 struct IndexHNSW;
-} // namespace knowhere
-} // namespace cppcontrib
 
 namespace gpu {
 
@@ -58,32 +54,45 @@ struct SearchParametersGpuHNSW : SearchParameters {
     int thread_block_size = 0;
 };
 
-/// GPU implementation of HNSW search.
+/// GPU implementation of HNSW search, built on vanilla faiss::IndexHNSW.
 ///
 /// This index type does NOT build an HNSW graph on GPU — it takes a
-/// CPU-built faiss::IndexHNSW (Flat or SQ storage), converts the graph
-/// to a GPU-friendly dense format, and runs the search on GPU using a
-/// parallel beam search kernel.
+/// CPU-built faiss::IndexHNSW (Flat or ScalarQuantizer storage), converts the
+/// graph to a GPU-friendly dense format, and runs the search on GPU using a
+/// parallel beam search kernel. Build on CPU with faiss::IndexHNSWFlat /
+/// IndexHNSWSQ, then copyFrom() or use index_cpu_to_gpu().
 ///
-/// Supports L2, inner product, and cosine metrics.
+/// Metric contract: METRIC_L2 and METRIC_INNER_PRODUCT are supported. As
+/// elsewhere in faiss, cosine similarity is obtained by L2-normalizing vectors
+/// and using METRIC_INNER_PRODUCT — there is no separate cosine metric and no
+/// inverse-norm buffer.
 /// Supports float32, fp16, bf16, and int8 (QT_8bit_direct_signed) data.
 /// Low-precision formats (int8/fp16/bf16) are kept in their native on-device
 /// byte layout and up-converted to fp32 per element inside the search kernel.
 ///
 /// Two search entry points exist:
-///   - searchHost(): the path Knowhere uses. Host in/out pointers, a single
-///     device sync at the end. Preferred for production.
+///   - searchHost(): host in/out pointers with a single device sync at the
+///     end. Lower latency than the search() override (no label round-trip).
+///     Optional bitset filtering (deletes/TTL/partitions) is supported here.
 ///   - searchImpl_(): the faiss-standard GpuIndex::search() override. It does a
 ///     D2H copy of labels, a CPU uint64->idx_t conversion, then an H2D copy
 ///     back, with a stream sync on each side. Correct but not latency-optimal;
 ///     a GPU-side label-conversion kernel to avoid the round-trip is a
-///     documented follow-up. Knowhere does not use this path.
+///     documented follow-up.
 struct GpuIndexHNSW : public GpuIndex {
    public:
     GpuIndexHNSW(
             GpuResourcesProvider* provider,
             int dims,
             faiss::MetricType metric = faiss::METRIC_L2,
+            GpuIndexHNSWConfig config = GpuIndexHNSWConfig());
+
+    /// Construct directly from a CPU-built faiss::IndexHNSW, mirroring the
+    /// GpuIndexFlat(provider, const IndexFlat*, config) convenience ctor used
+    /// by index_cpu_to_gpu().
+    GpuIndexHNSW(
+            GpuResourcesProvider* provider,
+            const faiss::IndexHNSW* index,
             GpuIndexHNSWConfig config = GpuIndexHNSWConfig());
 
     ~GpuIndexHNSW() override;
@@ -93,16 +102,16 @@ struct GpuIndexHNSW : public GpuIndex {
     /// Supports IndexHNSWFlat (float32) and IndexHNSWSQ
     /// (QT_8bit_direct_signed for INT8, QT_fp16/QT_bf16 kept native, or
     /// dequantized for other SQ types).
-    void copyFrom(const faiss::cppcontrib::knowhere::IndexHNSW* index);
+    void copyFrom(const faiss::IndexHNSW* index);
 
-    /// Like copyFrom(), but with the metric interpretation supplied by the
-    /// caller instead of being detected from the index type.
-    /// \param use_ip     treat the metric as inner product
-    /// \param is_cosine  the storage carries cosine (inverse L2) norms
-    void copyFromWithMetric(
-            const faiss::cppcontrib::knowhere::IndexHNSW* index,
-            bool use_ip,
-            bool is_cosine);
+    /// Copy the index back to CPU.
+    ///
+    /// GpuIndexHNSW is search-only: it uploads a CPU-built graph and does not
+    /// retain a reconstructable CPU-side copy of the link structure, so a
+    /// faithful gpu->cpu clone is not supported. This throws; keep the source
+    /// faiss::IndexHNSW to obtain a CPU index. Present so the CPU<->GPU cloner
+    /// surface is symmetric and the limitation is explicit.
+    void copyTo(faiss::IndexHNSW* index) const;
 
     void reset() override;
 
@@ -150,14 +159,11 @@ struct GpuIndexHNSW : public GpuIndex {
             idx_t* labels_host,
             const GpuHnswSearchParams& params) const;
 
-    /// Metric interpretation captured at copyFrom()/copyFromWithMetric() time
-    /// from the FAISS index type, so callers can post-process results (cosine
-    /// query normalization, IP handling) without re-deriving the metric from a
-    /// per-search config — the config may omit metric_type and default to L2,
-    /// which would silently mishandle a cosine/IP index.
-    bool isCosine() const {
-        return is_cosine_;
-    }
+    /// Metric interpretation captured at copyFrom() time
+    /// from the FAISS index type, so callers can post-process results (IP
+    /// handling) without re-deriving the metric from a per-search config — the
+    /// config may omit metric_type and default to L2, which would silently
+    /// mishandle an IP index.
     bool useInnerProduct() const {
         return use_ip_;
     }
@@ -184,8 +190,7 @@ struct GpuIndexHNSW : public GpuIndex {
     mutable GpuHnswSearchParams directSearchParams_;
     mutable bool hasDirectSearchParams_ = false;
 
-    // Metric interpretation, set at copy time (see isCosine()/useInnerProduct()).
-    bool is_cosine_ = false;
+    // Metric interpretation, set at copy time (see useInnerProduct()).
     bool use_ip_ = false;
 };
 
