@@ -225,6 +225,12 @@ void GpuIndexHNSW::searchImpl_(
             cudaMemcpyDeviceToDevice,
             stream));
 
+    // A filter may arrive through sticky setSearchParams() on this standard
+    // search() path too, so upload it before searching — mirroring searchHost /
+    // searchHostInt8. Without this, sp.bitset_data being non-null selects the
+    // filtered kernel while sc.d_bitset is still unallocated (illegal access).
+    upload_bitset_if_needed(sc, sp, nq, stream);
+
     gpu_hnsw_search(stream, sp, idx, sc, nq, k);
 
     // D2D: distances (output is a device pointer from GpuIndex::search)

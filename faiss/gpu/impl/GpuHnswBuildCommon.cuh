@@ -91,8 +91,12 @@ inline void extract_hnsw_layers(
         int& max_degree0,
         int& num_layers) {
     const int maxM0 = hnsw.nb_neighbors(0);
-    const int maxM = hnsw.nb_neighbors(1);
     const int max_lv = hnsw.max_level;
+    // nb_neighbors(1) indexes cum_nneighbor_per_level[2], which a degenerate
+    // layer-0-only index (max_level == 0) need not contain — reading it would
+    // be out of bounds. maxM is only used for the upper-layer loop below, which
+    // is empty when max_lv == 0, so fall back to maxM0 in that case.
+    const int maxM = (max_lv >= 1) ? hnsw.nb_neighbors(1) : maxM0;
 
     // The kernels dereference d_dataset + entry_point * dim directly, so a
     // malformed CPU index carrying an invalid/sentinel entry_point (e.g. -1
